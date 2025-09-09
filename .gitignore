@@ -12,6 +12,7 @@ modules.order
 .DS_Store
 *.swp
 *.swo
+*.log
 
 /user/gonzo_ctl
 /user/*.o
