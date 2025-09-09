@@ -32,13 +32,13 @@ static long gonzo_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned l
 {
     switch (cmd) {
     case GONZO_IOCTL_BUILD: {
-        int acpi_ret = gonzo_build_acpi_blob();
+        int acpi_ret = acpi_build_blob();
         if (acpi_ret)
             pr_warn(DRV_NAME ": ACPI build failed: %d\n", acpi_ret);
         else
             pr_info(DRV_NAME ": ACPI build ok, len=%zu\n", acpi_blob_len);
 
-        int pci_ret = gonzo_build_pci_blob();
+        int pci_ret = pci_build_blob();
         if (pci_ret)
             pr_warn(DRV_NAME ": PCI build failed: %d\n", pci_ret);
         else

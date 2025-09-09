@@ -25,8 +25,8 @@ extern uint8_t *pci_blob;
 extern size_t pci_blob_len;
 
 /* Build entrypoints */
-int gonzo_build_acpi_blob(void);
-int gonzo_build_pci_blob(void);
+int acpi_build_blob(void);
+int pci_build_blob(void);
 
 /* Optional helper exported */
 uint32_t ReadPCICfg(uint8_t bus, uint8_t dev, uint8_t fun, uint8_t of, uint8_t len);

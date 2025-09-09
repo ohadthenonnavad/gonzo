@@ -31,7 +31,7 @@ static void *append_blob(uint8_t **blob, size_t *len, const void *data, size_t a
 /**
  * gonzo_rsdp_checksum_ok - Validate ACPI RSDP checksum over len bytes
  */
-static bool gonzo_rsdp_checksum_ok(const u8 *p, size_t len)
+static bool rsdp_checksum_ok(const u8 *p, size_t len)
 {
     u8 sum = 0;
     size_t i;
@@ -47,7 +47,7 @@ static bool gonzo_rsdp_checksum_ok(const u8 *p, size_t len)
  *
  * Return: 0 on success or negative errno.
  */
-static int gonzo_append_table_phys(phys_addr_t pa, const char *why)
+static int append_table_phys(phys_addr_t pa, const char *why)
 {
     void __iomem *hdr_io;
     u32 len;
@@ -73,7 +73,7 @@ static int gonzo_append_table_phys(phys_addr_t pa, const char *why)
  * @base: mapped XSDT or RSDT base
  * @is_xsdt: true for XSDT (64-bit entries) false for RSDT (32-bit)
  */
-static void gonzo_collect_from_sdt(void __iomem *base, bool is_xsdt)
+static void collect_from_sdt(void __iomem *base, bool is_xsdt)
 {
     struct acpi_table_header __iomem *hdr = base;
     u32 total_len = le32_to_cpu(hdr->length);
@@ -113,9 +113,9 @@ static void gonzo_collect_from_sdt(void __iomem *base, bool is_xsdt)
                 memcpy_fromio(&fwctrl, (u8 __iomem *)th + sizeof(struct acpi_table_header) + 0x00, sizeof(u32));
                 memcpy_fromio(&dsdt, (u8 __iomem *)th + sizeof(struct acpi_table_header) + 0x04, sizeof(u32));
                 if (fwctrl)
-                    gonzo_append_table_phys((phys_addr_t)fwctrl, "FADT.FirmwareCtrl");
+                    append_table_phys((phys_addr_t)fwctrl, "FADT.FirmwareCtrl");
                 if (dsdt)
-                    gonzo_append_table_phys((phys_addr_t)dsdt, "FADT.Dsdt");
+                    append_table_phys((phys_addr_t)dsdt, "FADT.Dsdt");
             }
             acpi_os_unmap_iomem(th, tlen);
         }
@@ -129,7 +129,7 @@ static void gonzo_collect_from_sdt(void __iomem *base, bool is_xsdt)
  *
  * Return: 0 on success, negative errno otherwise.
  */
-static int gonzo_build_acpi_blob_manual(void)
+static int acpi_build_manual(void)
 {
     struct rsdp_v1 {
         char signature[8];
@@ -169,8 +169,8 @@ static int gonzo_build_acpi_blob_manual(void)
                 memcpy_fromio(sig_io, p, 8);
                 if (memcmp(sig_io, sig, 8) == 0) {
                     memcpy_fromio(&rsdp, p, sizeof(rsdp));
-                    if (gonzo_rsdp_checksum_ok((u8 *)&rsdp, 20) &&
-                        (rsdp.v1.revision == 0 || gonzo_rsdp_checksum_ok((u8 *)&rsdp, rsdp.length))) {
+                    if (rsdp_checksum_ok((u8 *)&rsdp, 20) &&
+                        (rsdp.v1.revision == 0 || rsdp_checksum_ok((u8 *)&rsdp, rsdp.length))) {
                         found = true;
                         pr_info(DRV_NAME ": ACPI: RSDP found via EBDA at %pa (offset %#zx)\n", &scan_pa, off);
                         break;
@@ -192,8 +192,8 @@ static int gonzo_build_acpi_blob_manual(void)
                 memcpy_fromio(sig_io2, p, 8);
                 if (memcmp(sig_io2, sig, 8) == 0) {
                     memcpy_fromio(&rsdp, p, sizeof(rsdp));
-                    if (gonzo_rsdp_checksum_ok((u8 *)&rsdp, 20) &&
-                        (rsdp.v1.revision == 0 || gonzo_rsdp_checksum_ok((u8 *)&rsdp, rsdp.length))) {
+                    if (rsdp_checksum_ok((u8 *)&rsdp, 20) &&
+                        (rsdp.v1.revision == 0 || rsdp_checksum_ok((u8 *)&rsdp, rsdp.length))) {
                         found = true;
                         pr_info(DRV_NAME ": ACPI: RSDP found via BIOS area at %pa (offset %#zx)\n", &scan_pa, off);
                         break;
@@ -230,7 +230,7 @@ static int gonzo_build_acpi_blob_manual(void)
         if (!base)
             return -ENODEV;
         append_blob(&acpi_blob, &acpi_blob_len, (const void __force *)base, len);
-        gonzo_collect_from_sdt(base, true);
+        collect_from_sdt(base, true);
         acpi_os_unmap_iomem(base, len);
         pr_info(DRV_NAME ": ACPI: (manual) total blob len after XSDT=%zu\n", acpi_blob_len);
         return 0;
@@ -250,7 +250,7 @@ static int gonzo_build_acpi_blob_manual(void)
         if (!base)
             return -ENODEV;
         append_blob(&acpi_blob, &acpi_blob_len, (const void __force *)base, len);
-        gonzo_collect_from_sdt(base, false);
+        collect_from_sdt(base, false);
         acpi_os_unmap_iomem(base, len);
         pr_info(DRV_NAME ": ACPI: (manual) total blob len after RSDT=%zu\n", acpi_blob_len);
         return 0;
@@ -262,7 +262,7 @@ static int gonzo_build_acpi_blob_manual(void)
  *
  * Return: 0 on success, negative errno otherwise.
  */
-int gonzo_build_acpi_blob(void)
+static int acpi_build_acpica(void)
 {
     struct acpi_table_header *xsdt = NULL;
     acpi_status status;
@@ -274,7 +274,7 @@ int gonzo_build_acpi_blob(void)
     acpi_blob = NULL;
     acpi_blob_len = 0;
 
-    pr_info(DRV_NAME ": ACPI: start build\n");
+    pr_info(DRV_NAME ": ACPI: start build via ACPICA\n");
 
     status = acpi_get_table(ACPI_SIG_XSDT, 0, &xsdt);
     pr_info(DRV_NAME ": ACPI: get XSDT status=%d ptr=%p\n", (int)status, xsdt);
@@ -283,7 +283,7 @@ int gonzo_build_acpi_blob(void)
         status = acpi_get_table(ACPI_SIG_RSDT, 0, &rsdt);
         pr_info(DRV_NAME ": ACPI: get RSDT status=%d ptr=%p\n", (int)status, rsdt);
         if (ACPI_FAILURE(status) || !rsdt)
-            return gonzo_build_acpi_blob_manual();
+            return acpi_build_manual();
         append_blob(&acpi_blob, &acpi_blob_len, rsdt, le32_to_cpu(rsdt->length));
         num_entries = (le32_to_cpu(rsdt->length) - sizeof(*rsdt)) / sizeof(u32);
         pr_info(DRV_NAME ": ACPI: RSDT len=%u entries=%d\n", le32_to_cpu(rsdt->length), num_entries);
@@ -343,6 +343,15 @@ int gonzo_build_acpi_blob(void)
     pr_info(DRV_NAME ": ACPI: total blob len after XSDT=%zu\n", acpi_blob_len);
     acpi_put_table(xsdt);
     return 0;
+}
+
+int acpi_build_blob(void)
+{
+    /* Decide ACPICA vs manual and call accordingly */
+    int ret;
+    /* Try ACPICA first; if it falls back to manual internally, fine. */
+    ret = acpi_build_acpica();
+    return ret;
 }
 
 MODULE_DESCRIPTION("Gonzo ACPI builder");

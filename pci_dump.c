@@ -106,7 +106,7 @@ EXPORT_SYMBOL(ReadPCICfg);
  *
  * Return: 0 if mapped, -ENODEV otherwise (caller will fall back to CF8/CFC).
  */
-static int gonzo_init_mmcfg_from_acpi(void)
+static int init_mmcfg_from_acpi(void)
 {
     struct acpi_table_mcfg *mcfg;
     acpi_status status;
@@ -144,7 +144,7 @@ static int gonzo_init_mmcfg_from_acpi(void)
  *
  * Return: 0 on success, negative errno on allocation or mapping failure.
  */
-int gonzo_build_pci_blob(void)
+int pci_build_blob(void)
 {
     int bus, dev, fun;
     int ret;
@@ -153,7 +153,7 @@ int gonzo_build_pci_blob(void)
     pci_blob_len = 0;
 
     mmcfg_base = NULL;
-    ret = gonzo_init_mmcfg_from_acpi();
+    ret = init_mmcfg_from_acpi();
     (void)ret;
 
     for (bus = 0; bus <= 0x4; bus++) {
