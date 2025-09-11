@@ -7,6 +7,11 @@
 
 /* IOCTLs */
 #define GONZO_IOCTL_BUILD _IO('G', 0x01)
+/* Time profiling ioctl (kernel-only hex dump output) */
+#define IOCTL_HV_TIMED_PROF _IO('G', 0x02)
+
+/* Hypervisor timing entrypoint */
+void hv_init(unsigned long iterations);
 
 /* Per-device header for PCI blobs */
 struct gonzo_pci_hdr {

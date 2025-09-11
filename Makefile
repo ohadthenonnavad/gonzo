@@ -1,5 +1,5 @@
 obj-m += gonzo.o
-gonzo-objs := gonzo_core.o acpi_dump.o pci_dump.o
+gonzo-objs := gonzo_core.o acpi_dump.o pci_dump.o hypervisor.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)

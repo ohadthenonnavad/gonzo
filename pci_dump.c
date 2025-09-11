@@ -148,6 +148,7 @@ int pci_build_blob(void)
 {
     int bus, dev, fun;
     int ret;
+    // Free any previous PCI blob to avoid memory leak before building a new one
     kfree(pci_blob);
     pci_blob = NULL;
     pci_blob_len = 0;

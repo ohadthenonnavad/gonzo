@@ -17,14 +17,15 @@ size_t acpi_blob_len;
 uint8_t *pci_blob;
 size_t pci_blob_len;
 
+/* moved to hypervisor.c */
+
 /**
  * gonzo_unlocked_ioctl - Handle control requests from userspace
  * @filp: opened file pointer for /dev/gonzo
- * @cmd: ioctl command (only GONZO_IOCTL_BUILD is supported)
- * @arg: unused for now
+ * @cmd: ioctl command (GONZO_IOCTL_BUILD, IOCTL_HV_TIMED_PROF)
+ * @arg: for IOCTL_HV_TIMED_PROF, iteration count (0 => default)
  *
- * Triggers both ACPI and PCI buffer builds. Each sub-build is attempted
- * independently; success is returned if at least one of them succeeds.
+ * Triggers ACPI/PCI buffer builds or runs timing profile and hex-dumps results.
  *
  * Return: 0 on success, -ENOTTY for unknown cmd, or sub-build error if both fail.
  */
@@ -46,6 +47,10 @@ static long gonzo_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned l
 
         if (acpi_ret && pci_ret)
             return acpi_ret;
+        return 0;
+    }
+    case IOCTL_HV_TIMED_PROF: {
+        hv_init(arg);
         return 0;
     }
     default:
