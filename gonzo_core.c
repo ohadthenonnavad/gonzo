@@ -22,10 +22,10 @@ size_t pci_blob_len;
 /**
  * gonzo_unlocked_ioctl - Handle control requests from userspace
  * @filp: opened file pointer for /dev/gonzo
- * @cmd: ioctl command (GONZO_IOCTL_BUILD, IOCTL_HV_TIMED_PROF)
+ * @cmd: ioctl command (GONZO_IOCTL_BUILD, IOCTL_HV_TIMED_PROF, IOCTL_TIMERS_DUMP)
  * @arg: for IOCTL_HV_TIMED_PROF, iteration count (0 => default)
  *
- * Triggers ACPI/PCI buffer builds or runs timing profile and hex-dumps results.
+ * Triggers ACPI/PCI buffer builds, runs timing profile, or dumps timer configurations.
  *
  * Return: 0 on success, -ENOTTY for unknown cmd, or sub-build error if both fail.
  */
@@ -33,13 +33,15 @@ static long gonzo_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned l
 {
     switch (cmd) {
     case GONZO_IOCTL_BUILD: {
-        int acpi_ret = acpi_build_blob();
+        int acpi_ret, pci_ret;
+        
+        acpi_ret = acpi_build_blob();
         if (acpi_ret)
             pr_warn(DRV_NAME ": ACPI build failed: %d\n", acpi_ret);
         else
             pr_info(DRV_NAME ": ACPI build ok, len=%zu\n", acpi_blob_len);
 
-        int pci_ret = pci_build_blob();
+        pci_ret = pci_build_blob();
         if (pci_ret)
             pr_warn(DRV_NAME ": PCI build failed: %d\n", pci_ret);
         else
@@ -52,6 +54,10 @@ static long gonzo_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned l
     case IOCTL_HV_TIMED_PROF: {
         hv_init(arg);
         return 0;
+    }
+    case IOCTL_TIMERS_DUMP: {
+        int ret = timers_dump_all();
+        return ret;
     }
     default:
         return -ENOTTY;
