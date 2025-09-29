@@ -1,0 +1,440 @@
+diff --git a/Makefile b/Makefile
+index c91b4d9..d3e495f 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,5 +1,5 @@
+ obj-m += gonzo.o
+-gonzo-objs := gonzo_core.o acpi_dump.o pci_dump.o hypervisor.o
++gonzo-objs := gonzo_core.o acpi_dump.o pci_dump.o hypervisor.o timers.o
+ 
+ KDIR ?= /lib/modules/$(shell uname -r)/build
+ PWD  := $(shell pwd)
+diff --git a/acpi_dump.c b/acpi_dump.c
+index e02da96..2cd757c 100644
+--- a/acpi_dump.c
++++ b/acpi_dump.c
+@@ -3,6 +3,7 @@
+ #include <linux/io.h>
+ #include <linux/slab.h>
+ #include <linux/acpi.h>
++#include <linux/version.h>
+ #include <linux/string.h>
+ #include "gonzo.h"
+ 
+@@ -341,7 +342,9 @@ static int acpi_build_acpica(void)
+         acpi_os_unmap_iomem(base, len);
+     }
+     pr_info(DRV_NAME ": ACPI: total blob len after XSDT=%zu\n", acpi_blob_len);
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
+     acpi_put_table(xsdt);
++#endif
+     return 0;
+ }
+ 
+diff --git a/build_and_deploy.sh b/build_and_deploy.sh
+index 855edf0..861b188 100755
+--- a/build_and_deploy.sh
++++ b/build_and_deploy.sh
+@@ -52,6 +52,9 @@ fi
+ 
+ echo "[*] Mounting loopback image: ${BOOT_IMAGE}"
+ TMPDIR="$(mktemp -d)"
++echo "====="
++echo $TMPDIR
++echo "====="
+ LOOPDEV=""
+ 
+ cleanup() {
+diff --git a/gonzo.h b/gonzo.h
+index 31df444..8607689 100644
+--- a/gonzo.h
++++ b/gonzo.h
+@@ -9,10 +9,15 @@
+ #define GONZO_IOCTL_BUILD _IO('G', 0x01)
+ /* Time profiling ioctl (kernel-only hex dump output) */
+ #define IOCTL_HV_TIMED_PROF _IO('G', 0x02)
++/* Timer configuration dump ioctl */
++#define IOCTL_TIMERS_DUMP _IO('G', 0x03)
+ 
+ /* Hypervisor timing entrypoint */
+ void hv_init(unsigned long iterations);
+ 
++/* Timer dump entrypoint */
++int timers_dump_all(void);
++
+ /* Per-device header for PCI blobs */
+ struct gonzo_pci_hdr {
+ 	uint8_t bus;
+diff --git a/hypervisor.c b/hypervisor.c
+index c8f5002..104a764 100644
+--- a/hypervisor.c
++++ b/hypervisor.c
+@@ -47,7 +47,10 @@ static inline void cpuid_query(u32 leaf, u32 subleaf, u32 *a, u32 *b, u32 *c, u3
+ {
+     u32 ra, rb, rc, rd;
+     asm volatile("cpuid" : "=a"(ra), "=b"(rb), "=c"(rc), "=d"(rd) : "a"(leaf), "c"(subleaf) : "memory");
+-    if (a) *a = ra; if (b) *b = rb; if (c) *c = rc; if (d) *d = rd;
++    if (a) *a = ra;
++    if (b) *b = rb;
++    if (c) *c = rc;
++    if (d) *d = rd;
+ }
+ 
+ /**
+diff --git a/pci_dump.c b/pci_dump.c
+index 12073fc..2a4cc2c 100644
+--- a/pci_dump.c
++++ b/pci_dump.c
+@@ -2,7 +2,11 @@
+ #include <linux/module.h>
+ #include <linux/io.h>
+ #include <linux/slab.h>
++#include <linux/version.h>
++#ifdef CONFIG_ACPI
+ #include <linux/acpi.h>
++#include <acpi/actbl1.h>
++#endif
+ #include <linux/pci_regs.h>
+ #include "gonzo.h"
+ 
+@@ -106,6 +110,7 @@ EXPORT_SYMBOL(ReadPCICfg);
+  *
+  * Return: 0 if mapped, -ENODEV otherwise (caller will fall back to CF8/CFC).
+  */
++#ifdef CONFIG_ACPI
+ static int init_mmcfg_from_acpi(void)
+ {
+     struct acpi_table_mcfg *mcfg;
+@@ -123,7 +128,7 @@ static int init_mmcfg_from_acpi(void)
+             u16 seg = le16_to_cpu(alloc[i].pci_segment);
+             u8 sb = alloc[i].start_bus_number;
+             u8 eb = alloc[i].end_bus_number;
+-            if (seg == 0 && sb <= 4) {
++            if (seg == 0) {
+                 phys_addr_t map_base = (phys_addr_t)base + ((u64)0 << 20);
+                 void __iomem *mm = ioremap(map_base, (eb - sb + 1) * (1ULL << 20));
+                 if (mm) {
+@@ -135,9 +140,20 @@ static int init_mmcfg_from_acpi(void)
+             }
+         }
+     }
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
+     acpi_put_table(&mcfg->header);
++#else
++    /* On older kernels 3.x, acpi_put_table may not exist; nothing to do */
++#endif
+     return mmcfg_base ? 0 : -ENODEV;
+ }
++#else
++static int init_mmcfg_from_acpi(void)
++{
++    /* ACPI not available at build time; force CF8/CFC compatibility path */
++    return -ENODEV;
++}
++#endif
+ 
+ /**
+  * gonzo_build_pci_blob - Build concatenated PCI headers + config spaces
+@@ -148,6 +164,8 @@ int pci_build_blob(void)
+ {
+     int bus, dev, fun;
+     int ret;
++    u8 bus_start = 0, bus_end = 4;  // Default fallback range
++    
+     // Free any previous PCI blob to avoid memory leak before building a new one
+     kfree(pci_blob);
+     pci_blob = NULL;
+@@ -155,9 +173,19 @@ int pci_build_blob(void)
+ 
+     mmcfg_base = NULL;
+     ret = init_mmcfg_from_acpi();
+-    (void)ret;
++    if (ret == 0) {
++        // Use MMCONFIG range if available
++        bus_start = mmcfg_bus_start;
++        bus_end = mmcfg_bus_end;
++        pr_info(DRV_NAME ": Using MMCONFIG range: buses %d-%d\n", bus_start, bus_end);
++    } else {
++        // If MMCONFIG fails, scan a reasonable range with CF8/CFC
++        bus_start = 0;
++        bus_end = 31;  // Scan buses 0-31 with CF8/CFC
++        pr_info(DRV_NAME ": MMCONFIG failed, using CF8/CFC for buses %d-%d\n", bus_start, bus_end);
++    }
+ 
+-    for (bus = 0; bus <= 0x4; bus++) {
++    for (bus = bus_start; bus <= bus_end; bus++) {
+         for (dev = 0; dev < 32; dev++) {
+             for (fun = 0; fun < 8; fun++) {
+                 u16 vendor;
+diff --git a/timers.c b/timers.c
+index f689b8e..7df6696 100644
+--- a/timers.c
++++ b/timers.c
+@@ -24,6 +24,7 @@
+ #include <asm/hpet.h>
+ #include <asm/cpu.h>
+ #include <asm/processor.h>
++#include <linux/version.h>
+ #include "gonzo.h"
+ 
+ /* Debug macro - replace with custom implementation later */
+@@ -44,25 +45,11 @@ struct timer_header {
+     __le32 data_size;      /* size of following data in bytes */
+ } __packed;
+ 
+-/* HPET register structure (simplified) */
+-struct hpet_regs {
+-    __le64 capabilities;   /* General capabilities */
+-    __le64 config;         /* General configuration */
+-    __le64 reserved1;      /* Reserved */
+-    __le64 int_status;     /* Interrupt status */
+-    __le64 reserved2[4];   /* Reserved */
+-    __le64 counter;        /* Main counter value */
+-    __le64 reserved3;      /* Reserved */
+-} __packed;
++/* HPET memory space - dump entire mapped region */
++#define HPET_MEM_SIZE 0x1000  /* 4KB HPET memory space */
+ 
+-/* APIC timer configuration */
+-struct apic_timer_config {
+-    __le32 lvt_timer;      /* Local Vector Table Timer */
+-    __le32 initial_count;  /* Initial count */
+-    __le32 current_count;  /* Current count */
+-    __le32 divide_config;  /* Divide configuration */
+-    __le32 tsc_deadline;   /* TSC-Deadline mode support */
+-} __packed;
++/* APIC memory space - dump entire mapped region */
++#define APIC_MEM_SIZE 0x1000  /* 4KB APIC memory space */
+ 
+ /* ACPI timer data */
+ struct acpi_timer_data {
+@@ -129,22 +116,44 @@ static int append_timer_data(uint8_t **buffer, size_t *len, enum timer_type time
+  */
+ static int dump_hpet_config(void)
+ {
+-    struct hpet_regs hpet_data;
+     void __iomem *hpet_base;
+     phys_addr_t hpet_phys;
+-    struct acpi_table_hpet *hpet_table;
+-    acpi_status status;
++    u8 *hpet_mem_data;
+     int ret = 0;
+     
+-    /* Allocate new buffer */
+-    hpet_buffer = kmalloc(sizeof(struct timer_header) + sizeof(hpet_data), GFP_KERNEL);
++    /* Allocate new buffer for entire HPET memory space */
++    hpet_buffer = kmalloc(sizeof(struct timer_header) + HPET_MEM_SIZE, GFP_KERNEL);
+     if (!hpet_buffer) {
+         pr_err(DRV_NAME ": Failed to allocate HPET buffer\n");
+         return -ENOMEM;
+     }
+     hpet_buffer_len = 0;
+     
+-    /* Check if HPET is supported - use ACPI table approach for older kernels */
++    /* Check if HPET is supported - use kernel version compatible approach */
++#if defined(CONFIG_ACPI) && LINUX_VERSION_CODE >= KERNEL_VERSION(5, 5, 0)
++    /* Newer kernels: try FADT first, fallback to table */
++    if (acpi_gbl_FADT.hpet_block && acpi_gbl_FADT.hpet_block.address) {
++        hpet_phys = acpi_gbl_FADT.hpet_block.address;
++        DBG("Using HPET from FADT (newer kernel)\n");
++    } else {
++        struct acpi_table_hpet *hpet_table;
++        acpi_status status;
++        
++        status = acpi_get_table(ACPI_SIG_HPET, 0, (struct acpi_table_header **)&hpet_table);
++        if (ACPI_FAILURE(status) || !hpet_table) {
++            pr_warn(DRV_NAME ": HPET not found in FADT or ACPI table\n");
++            kfree(hpet_buffer);
++            hpet_buffer = NULL;
++            return -ENODEV;
++        }
++        hpet_phys = hpet_table->address.address;
++        acpi_put_table(&hpet_table->header);
++        DBG("Using HPET from ACPI table (newer kernel)\n");
++    }
++#else /* older kernels or ACPI disabled */
++    /* Older kernels: use ACPI table approach */
++    struct acpi_table_hpet *hpet_table;
++    acpi_status status;
+     
+     status = acpi_get_table(ACPI_SIG_HPET, 0, (struct acpi_table_header **)&hpet_table);
+     if (ACPI_FAILURE(status) || !hpet_table) {
+@@ -153,21 +162,24 @@ static int dump_hpet_config(void)
+         hpet_buffer = NULL;
+         return -ENODEV;
+     }
+-    
+-    /* Get HPET base address from ACPI table */
+     hpet_phys = hpet_table->address.address;
++    #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
++    acpi_put_table(&hpet_table->header);
++    #endif
++    DBG("Using HPET from ACPI table (older kernel)\n");
++#endif
++    
+     if (!hpet_phys) {
+-        pr_warn(DRV_NAME ": HPET base address not found in ACPI\n");
++        pr_warn(DRV_NAME ": HPET base address not found\n");
+         kfree(hpet_buffer);
+         hpet_buffer = NULL;
+         return -ENODEV;
+     }
+     
+-    DBG("HPET supported, base address: 0x%llx\n", 
+-        (unsigned long long)hpet_phys);
++    DBG("HPET supported, base address: 0x%llx\n", (unsigned long long)hpet_phys);
+     
+-    /* Map HPET MMIO region */
+-    hpet_base = ioremap(hpet_phys, sizeof(hpet_data));
++    /* Map entire HPET MMIO region */
++    hpet_base = ioremap(hpet_phys, HPET_MEM_SIZE);
+     if (!hpet_base) {
+         pr_err(DRV_NAME ": Failed to map HPET MMIO region\n");
+         kfree(hpet_buffer);
+@@ -175,19 +187,24 @@ static int dump_hpet_config(void)
+         return -ENOMEM;
+     }
+     
+-    /* Read HPET registers */
+-    hpet_data.capabilities = readq(hpet_base + 0x00);
+-    hpet_data.config = readq(hpet_base + 0x10);
+-    hpet_data.reserved1 = readq(hpet_base + 0x18);
+-    hpet_data.int_status = readq(hpet_base + 0x20);
+-    hpet_data.counter = readq(hpet_base + 0xf0);
++    /* Read entire HPET memory space */
++    hpet_mem_data = kmalloc(HPET_MEM_SIZE, GFP_KERNEL);
++    if (!hpet_mem_data) {
++        pr_err(DRV_NAME ": Failed to allocate HPET memory data buffer\n");
++        iounmap(hpet_base);
++        kfree(hpet_buffer);
++        hpet_buffer = NULL;
++        return -ENOMEM;
++    }
++    
++    memcpy_fromio(hpet_mem_data, hpet_base, HPET_MEM_SIZE);
+     
+-    /* Append to buffer */
++    /* Append entire memory space to buffer */
+     ret = append_timer_data(&hpet_buffer, &hpet_buffer_len, TIMER_HPET,
+-                           &hpet_data, sizeof(hpet_data));
++                           hpet_mem_data, HPET_MEM_SIZE);
+     
+     iounmap(hpet_base);
+-    acpi_put_table(&hpet_table->header);
++    kfree(hpet_mem_data);
+     
+     if (ret) {
+         kfree(hpet_buffer);
+@@ -207,12 +224,12 @@ static int dump_hpet_config(void)
+  */
+ static int dump_apic_config(void)
+ {
+-    struct apic_timer_config apic_data;
+-    u32 lvt, div, tsc_deadline_support = 0;
++    void __iomem *apic_base;
++    u8 *apic_mem_data;
+     int ret = 0;
+     
+-    /* Allocate new buffer */
+-    apic_buffer = kmalloc(sizeof(struct timer_header) + sizeof(apic_data), GFP_KERNEL);
++    /* Allocate new buffer for entire APIC memory space */
++    apic_buffer = kmalloc(sizeof(struct timer_header) + APIC_MEM_SIZE, GFP_KERNEL);
+     if (!apic_buffer) {
+         pr_err(DRV_NAME ": Failed to allocate APIC buffer\n");
+         return -ENOMEM;
+@@ -228,29 +245,35 @@ static int dump_apic_config(void)
+     }
+     
+     /* For older kernels, we'll assume APIC is initialized if the feature is present */
+-    DBG("APIC feature detected, proceeding with timer configuration\n");
++    DBG("APIC feature detected, proceeding with memory dump\n");
+     
+-    /* Read APIC timer configuration */
+-    lvt = apic_read(APIC_LVTT);
+-    div = apic_read(APIC_TDCR);
++    /* Map APIC memory space - use default base address */
++    apic_base = ioremap(0xFEE00000, APIC_MEM_SIZE);  /* Default local APIC base */
++    if (!apic_base) {
++        pr_err(DRV_NAME ": Failed to map APIC memory region\n");
++        kfree(apic_buffer);
++        apic_buffer = NULL;
++        return -ENOMEM;
++    }
+     
+-    /* Check TSC-Deadline support */
+-    if (boot_cpu_has(X86_FEATURE_TSC_DEADLINE_TIMER)) {
+-        tsc_deadline_support = 1;
+-        DBG("TSC-Deadline timer mode supported\n");
+-    } else {
+-        DBG("TSC-Deadline timer mode not supported\n");
++    /* Read entire APIC memory space */
++    apic_mem_data = kmalloc(APIC_MEM_SIZE, GFP_KERNEL);
++    if (!apic_mem_data) {
++        pr_err(DRV_NAME ": Failed to allocate APIC memory data buffer\n");
++        iounmap(apic_base);
++        kfree(apic_buffer);
++        apic_buffer = NULL;
++        return -ENOMEM;
+     }
+     
+-    apic_data.lvt_timer = cpu_to_le32(lvt);
+-    apic_data.initial_count = cpu_to_le32(apic_read(APIC_TMICT));
+-    apic_data.current_count = cpu_to_le32(apic_read(APIC_TMCCT));
+-    apic_data.divide_config = cpu_to_le32(div);
+-    apic_data.tsc_deadline = cpu_to_le32(tsc_deadline_support);
++    memcpy_fromio(apic_mem_data, apic_base, APIC_MEM_SIZE);
+     
+-    /* Append to buffer */
++    /* Append entire memory space to buffer */
+     ret = append_timer_data(&apic_buffer, &apic_buffer_len, TIMER_APIC,
+-                           &apic_data, sizeof(apic_data));
++                           apic_mem_data, APIC_MEM_SIZE);
++    
++    iounmap(apic_base);
++    kfree(apic_mem_data);
+     
+     if (ret) {
+         kfree(apic_buffer);
+@@ -445,6 +468,7 @@ int timers_dump_all(void)
+     int success_count = 0;
+     
+     pr_info(DRV_NAME ": Starting timer configuration dump\n");
++    DBG("Entering timers_dump_all function\n");
+     
+     hpet_ret = dump_hpet_config();
+     if (hpet_ret) {
+diff --git a/user/gonzo_ctl.c b/user/gonzo_ctl.c
+index 83ba1fa..f016f16 100644
+--- a/user/gonzo_ctl.c
++++ b/user/gonzo_ctl.c
+@@ -13,11 +13,14 @@
+ #ifndef IOCTL_HV_TIMED_PROF
+ #define IOCTL_HV_TIMED_PROF _IO('G', 0x02)
+ #endif
++#ifndef IOCTL_TIMERS_DUMP
++#define IOCTL_TIMERS_DUMP _IO('G', 0x03)
++#endif
+ 
+ static void usage(const char *prog)
+ {
+-	printf("Usage: %s [--hv-prof [iterations]]\n", prog);
+-	fprintf(stderr, "Without flags, triggers build ioctl. --hv-prof triggers timing (default 200 iters).\n");
++	printf("Usage: %s [--hv-prof [iterations] | --timers]\n", prog);
++	fprintf(stderr, "Without flags, triggers build ioctl. --hv-prof triggers timing (default 200 iters). --timers dumps timer configs.\n");
+ }
+ 
+ int main(int argc, char **argv)
+@@ -45,6 +48,13 @@ int main(int argc, char **argv)
+ 			return 1;
+ 		}
+ 		printf("gonzo: HV_TIMED_PROF triggered (iterations=%lu). Check dmesg.\n", iterations);
++	} else if (argc >= 2 && (strcmp(argv[1], "--timers") == 0 || strcmp(argv[1], "-t") == 0)) {
++		if (ioctl(fd, IOCTL_TIMERS_DUMP, 0) != 0) {
++			perror("ioctl IOCTL_TIMERS_DUMP");
++			close(fd);
++			return 1;
++		}
++		printf("gonzo: timers dump triggered. Check dmesg.\n");
+ 	} else {
+ 		if (ioctl(fd, GONZO_IOCTL_BUILD, 0) != 0) {
+ 			perror("ioctl BUILD");

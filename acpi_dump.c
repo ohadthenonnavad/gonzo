@@ -3,30 +3,11 @@
 #include <linux/io.h>
 #include <linux/slab.h>
 #include <linux/acpi.h>
+#include <linux/version.h>
 #include <linux/string.h>
 #include "gonzo.h"
 
-/**
- * append_blob - Grow a heap buffer and append bytes
- * @blob: pointer to buffer pointer
- * @len: pointer to current length
- * @data: source bytes to append
- * @add: number of bytes to add
- *
- * Return: pointer to the start of appended region on success, NULL on OOM.
- */
-static void *append_blob(uint8_t **blob, size_t *len, const void *data, size_t add)
-{
-    void *dst;
-    uint8_t *newbuf = krealloc(*blob, *len + add, GFP_KERNEL);
-    if (!newbuf)
-        return NULL;
-    dst = newbuf + *len;
-    memcpy(dst, data, add);
-    *blob = newbuf;
-    *len += add;
-    return dst;
-}
+
 
 /**
  * gonzo_rsdp_checksum_ok - Validate ACPI RSDP checksum over len bytes
@@ -63,7 +44,7 @@ static int append_table_phys(phys_addr_t pa, const char *why)
     if (!tbl_io)
         return -ENODEV;
     append_blob(&acpi_blob, &acpi_blob_len, (const void __force *)tbl_io, len);
-    pr_info(DRV_NAME ": ACPI: appended table via %s pa=%pa len=%u\n", why, &pa, len);
+    DBG("ACPI: appended table via %s pa=%pa len=%u\n", why, &pa, len);
     acpi_os_unmap_iomem(tbl_io, len);
     return 0;
 }
@@ -80,7 +61,7 @@ static void collect_from_sdt(void __iomem *base, bool is_xsdt)
     int entry_size = is_xsdt ? sizeof(u64) : sizeof(u32);
     int cnt = (total_len - sizeof(struct acpi_table_header)) / entry_size;
     int i;
-    pr_info(DRV_NAME ": ACPI: (manual) %s entries=%d\n", is_xsdt ? "XSDT" : "RSDT", cnt);
+    DBG("ACPI: (manual) %s entries=%d\n", is_xsdt ? "XSDT" : "RSDT", cnt);
     for (i = 0; i < cnt; i++) {
         phys_addr_t tpa;
         if (is_xsdt) {
@@ -105,7 +86,7 @@ static void collect_from_sdt(void __iomem *base, bool is_xsdt)
             th = acpi_os_map_iomem(tpa, tlen);
             if (!th)
                 continue;
-            pr_info(DRV_NAME ": ACPI: (manual) %s entry %d pa=%pa sig=%s len=%u\n",
+            DBG("ACPI: (manual) %s entry %d pa=%pa sig=%s len=%u\n",
                     is_xsdt ? "XSDT" : "RSDT", i, &tpa, sig4, tlen);
             append_blob(&acpi_blob, &acpi_blob_len, (const void __force *)th, tlen);
             if (sig4[0] == 'F' && sig4[1] == 'A' && sig4[2] == 'C' && sig4[3] == 'P') {
@@ -172,7 +153,7 @@ static int acpi_build_manual(void)
                     if (rsdp_checksum_ok((u8 *)&rsdp, 20) &&
                         (rsdp.v1.revision == 0 || rsdp_checksum_ok((u8 *)&rsdp, rsdp.length))) {
                         found = true;
-                        pr_info(DRV_NAME ": ACPI: RSDP found via EBDA at %pa (offset %#zx)\n", &scan_pa, off);
+        DBG("ACPI: RSDP found via EBDA at %pa (offset %#zx)\n", &scan_pa, off);
                         break;
                     }
                 }
@@ -195,7 +176,7 @@ static int acpi_build_manual(void)
                     if (rsdp_checksum_ok((u8 *)&rsdp, 20) &&
                         (rsdp.v1.revision == 0 || rsdp_checksum_ok((u8 *)&rsdp, rsdp.length))) {
                         found = true;
-                        pr_info(DRV_NAME ": ACPI: RSDP found via BIOS area at %pa (offset %#zx)\n", &scan_pa, off);
+        DBG("ACPI: RSDP found via BIOS area at %pa (offset %#zx)\n", &scan_pa, off);
                         break;
                     }
                 }
@@ -206,11 +187,11 @@ static int acpi_build_manual(void)
     }
 
     if (!found) {
-        pr_info(DRV_NAME ": ACPI: manual RSDP scan failed\n");
+    DBG("ACPI: manual RSDP scan failed\n");
         return -ENODEV;
     }
 
-    pr_info(DRV_NAME ": ACPI: RSDP found rev=%u rsdt=%#x xsdt=%#llx len=%u\n",
+    DBG("ACPI: RSDP found rev=%u rsdt=%#x xsdt=%#llx len=%u\n",
             rsdp.v1.revision,
             rsdp.v1.rsdt_physical_address,
             (unsigned long long)rsdp.xsdt_physical_address,
@@ -232,7 +213,7 @@ static int acpi_build_manual(void)
         append_blob(&acpi_blob, &acpi_blob_len, (const void __force *)base, len);
         collect_from_sdt(base, true);
         acpi_os_unmap_iomem(base, len);
-        pr_info(DRV_NAME ": ACPI: (manual) total blob len after XSDT=%zu\n", acpi_blob_len);
+        DBG("ACPI: (manual) total blob len after XSDT=%zu\n", acpi_blob_len);
         return 0;
     }
 
@@ -252,7 +233,7 @@ static int acpi_build_manual(void)
         append_blob(&acpi_blob, &acpi_blob_len, (const void __force *)base, len);
         collect_from_sdt(base, false);
         acpi_os_unmap_iomem(base, len);
-        pr_info(DRV_NAME ": ACPI: (manual) total blob len after RSDT=%zu\n", acpi_blob_len);
+        DBG("ACPI: (manual) total blob len after RSDT=%zu\n", acpi_blob_len);
         return 0;
     }
 }
@@ -274,19 +255,19 @@ static int acpi_build_acpica(void)
     acpi_blob = NULL;
     acpi_blob_len = 0;
 
-    pr_info(DRV_NAME ": ACPI: start build via ACPICA\n");
+    DBG("ACPI: start build via ACPICA\n");
 
     status = acpi_get_table(ACPI_SIG_XSDT, 0, &xsdt);
-    pr_info(DRV_NAME ": ACPI: get XSDT status=%d ptr=%p\n", (int)status, xsdt);
+    DBG("ACPI: get XSDT status=%d ptr=%p\n", (int)status, xsdt);
     if (ACPI_FAILURE(status) || !xsdt) {
         struct acpi_table_header *rsdt = NULL;
         status = acpi_get_table(ACPI_SIG_RSDT, 0, &rsdt);
-        pr_info(DRV_NAME ": ACPI: get RSDT status=%d ptr=%p\n", (int)status, rsdt);
+        DBG("ACPI: get RSDT status=%d ptr=%p\n", (int)status, rsdt);
         if (ACPI_FAILURE(status) || !rsdt)
             return acpi_build_manual();
         append_blob(&acpi_blob, &acpi_blob_len, rsdt, le32_to_cpu(rsdt->length));
         num_entries = (le32_to_cpu(rsdt->length) - sizeof(*rsdt)) / sizeof(u32);
-        pr_info(DRV_NAME ": ACPI: RSDT len=%u entries=%d\n", le32_to_cpu(rsdt->length), num_entries);
+        DBG("ACPI: RSDT len=%u entries=%d\n", le32_to_cpu(rsdt->length), num_entries);
         for (i = 0; i < num_entries; i++) {
             phys_addr_t pa = ((u32 __force *)((u8 *)rsdt + sizeof(*rsdt)))[i];
             struct acpi_table_header __iomem *hdr;
@@ -300,7 +281,7 @@ static int acpi_build_acpica(void)
                 char sig[5];
                 memcpy(sig, hdr->signature, 4);
                 sig[4] = '\0';
-                pr_info(DRV_NAME ": ACPI: RSDT entry %d pa=%pa sig=%s len=%u\n", i, &pa, sig, len);
+                DBG("ACPI: RSDT entry %d pa=%pa sig=%s len=%u\n", i, &pa, sig, len);
             }
             acpi_os_unmap_iomem(base, sizeof(struct acpi_table_header));
             base = acpi_os_map_iomem(pa, len);
@@ -309,7 +290,7 @@ static int acpi_build_acpica(void)
             append_blob(&acpi_blob, &acpi_blob_len, (const void __force *)base, len);
             acpi_os_unmap_iomem(base, len);
         }
-        pr_info(DRV_NAME ": ACPI: total blob len after RSDT=%zu\n", acpi_blob_len);
+        DBG("ACPI: total blob len after RSDT=%zu\n", acpi_blob_len);
         acpi_put_table(rsdt);
         return 0;
     }
@@ -317,7 +298,7 @@ static int acpi_build_acpica(void)
     append_blob(&acpi_blob, &acpi_blob_len, xsdt, le32_to_cpu(xsdt->length));
     entries = (uint64_t *)((u8 *)xsdt + sizeof(*xsdt));
     num_entries = (le32_to_cpu(xsdt->length) - sizeof(*xsdt)) / sizeof(u64);
-    pr_info(DRV_NAME ": ACPI: XSDT len=%u entries=%d\n", le32_to_cpu(xsdt->length), num_entries);
+    DBG("ACPI: XSDT len=%u entries=%d\n", le32_to_cpu(xsdt->length), num_entries);
     for (i = 0; i < num_entries; i++) {
         phys_addr_t pa = (phys_addr_t)le64_to_cpu(entries[i]);
         struct acpi_table_header __iomem *hdr;
@@ -331,7 +312,7 @@ static int acpi_build_acpica(void)
             char sig[5];
             memcpy(sig, hdr->signature, 4);
             sig[4] = '\0';
-            pr_info(DRV_NAME ": ACPI: XSDT entry %d pa=%pa sig=%s len=%u\n", i, &pa, sig, len);
+            DBG("ACPI: XSDT entry %d pa=%pa sig=%s len=%u\n", i, &pa, sig, len);
         }
         acpi_os_unmap_iomem(base, sizeof(struct acpi_table_header));
         base = acpi_os_map_iomem(pa, len);
@@ -340,8 +321,10 @@ static int acpi_build_acpica(void)
         append_blob(&acpi_blob, &acpi_blob_len, (const void __force *)base, len);
         acpi_os_unmap_iomem(base, len);
     }
-    pr_info(DRV_NAME ": ACPI: total blob len after XSDT=%zu\n", acpi_blob_len);
+    DBG("ACPI: total blob len after XSDT=%zu\n", acpi_blob_len);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
     acpi_put_table(xsdt);
+#endif
     return 0;
 }
 
@@ -351,6 +334,11 @@ int acpi_build_blob(void)
     int ret;
     /* Try ACPICA first; if it falls back to manual internally, fine. */
     ret = acpi_build_acpica();
+	if (ret == 0 && acpi_blob_len > 0) {
+		int dump_ret = gonzo_dump_to_file("dekermit.acpi", acpi_blob, acpi_blob_len);
+		if (dump_ret)
+			DBG("failed to dump ACPI blob: %d\n", dump_ret);
+	}
     return ret;
 }
 

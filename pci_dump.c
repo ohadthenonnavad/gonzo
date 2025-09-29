@@ -2,31 +2,17 @@
 #include <linux/module.h>
 #include <linux/io.h>
 #include <linux/slab.h>
+#include <linux/version.h>
+#ifdef CONFIG_ACPI
 #include <linux/acpi.h>
+#include <acpi/actbl1.h>
+#endif
 #include <linux/pci_regs.h>
 #include "gonzo.h"
 
-/**
- * append_blob - Grow a heap buffer and append bytes
- * @blob: pointer to buffer pointer
- * @len: pointer to current length
- * @data: source bytes to append
- * @add: number of bytes to add
- *
- * Return: pointer to the start of appended region on success, NULL on OOM.
- */
-static void *append_blob(uint8_t **blob, size_t *len, const void *data, size_t add)
-{
-    void *dst;
-    uint8_t *newbuf = krealloc(*blob, *len + add, GFP_KERNEL);
-    if (!newbuf)
-        return NULL;
-    dst = newbuf + *len;
-    memcpy(dst, data, add);
-    *blob = newbuf;
-    *len += add;
-    return dst;
-}
+#define DBG(fmt, ...) printk(KERN_DEBUG "gonzo: " fmt, ##__VA_ARGS__)
+
+
 
 static void __iomem *mmcfg_base;
 static u8 mmcfg_bus_start;
@@ -106,6 +92,7 @@ EXPORT_SYMBOL(ReadPCICfg);
  *
  * Return: 0 if mapped, -ENODEV otherwise (caller will fall back to CF8/CFC).
  */
+#ifdef CONFIG_ACPI
 static int init_mmcfg_from_acpi(void)
 {
     struct acpi_table_mcfg *mcfg;
@@ -123,7 +110,7 @@ static int init_mmcfg_from_acpi(void)
             u16 seg = le16_to_cpu(alloc[i].pci_segment);
             u8 sb = alloc[i].start_bus_number;
             u8 eb = alloc[i].end_bus_number;
-            if (seg == 0 && sb <= 4) {
+            if (seg == 0) {
                 phys_addr_t map_base = (phys_addr_t)base + ((u64)0 << 20);
                 void __iomem *mm = ioremap(map_base, (eb - sb + 1) * (1ULL << 20));
                 if (mm) {
@@ -135,9 +122,20 @@ static int init_mmcfg_from_acpi(void)
             }
         }
     }
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
     acpi_put_table(&mcfg->header);
+#else
+    /* On older kernels 3.x, acpi_put_table may not exist; nothing to do */
+#endif
     return mmcfg_base ? 0 : -ENODEV;
 }
+#else
+static int init_mmcfg_from_acpi(void)
+{
+    /* ACPI not available at build time; force CF8/CFC compatibility path */
+    return -ENODEV;
+}
+#endif
 
 /**
  * gonzo_build_pci_blob - Build concatenated PCI headers + config spaces
@@ -148,6 +146,8 @@ int pci_build_blob(void)
 {
     int bus, dev, fun;
     int ret;
+    u8 bus_start = 0, bus_end = 4;  // Default fallback range
+    
     // Free any previous PCI blob to avoid memory leak before building a new one
     kfree(pci_blob);
     pci_blob = NULL;
@@ -155,9 +155,19 @@ int pci_build_blob(void)
 
     mmcfg_base = NULL;
     ret = init_mmcfg_from_acpi();
-    (void)ret;
+    if (ret == 0) {
+        // Use MMCONFIG range if available
+        bus_start = mmcfg_bus_start;
+        bus_end = mmcfg_bus_end;
+        DBG("Using MMCONFIG range: buses %d-%d\n", bus_start, bus_end);
+    } else {
+        // If MMCONFIG fails, scan a reasonable range with CF8/CFC
+        bus_start = 0;
+        bus_end = 31;  // Scan buses 0-31 with CF8/CFC
+        DBG("MMCONFIG failed, using CF8/CFC for buses %d-%d\n", bus_start, bus_end);
+    }
 
-    for (bus = 0; bus <= 0x4; bus++) {
+    for (bus = bus_start; bus <= bus_end; bus++) {
         for (dev = 0; dev < 32; dev++) {
             for (fun = 0; fun < 8; fun++) {
                 u16 vendor;
@@ -165,10 +175,41 @@ int pci_build_blob(void)
                 vendor = (u16)(v & 0xFFFF);
                 if (vendor == 0xFFFF)
                     continue;
+                    
+                u32 dev_id = ReadPCICfg((u8)bus, (u8)dev, (u8)fun, 0x02, 2);
+                u32 class_code = ReadPCICfg((u8)bus, (u8)dev, (u8)fun, 0x0A, 3);
+                DBG("Found PCI device %02x:%02x.%d: VendorID=%04x, DeviceID=%04x, Class=%06x\n", 
+                    bus, dev, fun, vendor, dev_id, class_code);
 
                 {
                     bool use_mmcfg = mmcfg_covers_bus((u8)bus);
-                    u32 cfg_size = use_mmcfg ? 4096u : 256u;
+                    u32 cfg_size = 256u; // Default to 256 bytes (PCI)
+                    
+                    // Check if device supports PCIe (which has 4K config space)
+                    u32 status = ReadPCICfg((u8)bus, (u8)dev, (u8)fun, 0x04, 2);
+                    if (status & (1 << 4)) { // Check if Capabilities List bit is set
+                        u8 cap_ptr = ReadPCICfg((u8)bus, (u8)dev, (u8)fun, 0x34, 1);
+                        
+                        // Walk the capabilities list looking for PCIe capability
+                        while (cap_ptr != 0 && cap_ptr != 0xFF) {
+                            u32 cap = ReadPCICfg((u8)bus, (u8)dev, (u8)fun, cap_ptr, 4);
+                            if ((cap & 0xFF) == 0x10) { // PCIe capability ID
+                                cfg_size = 4096u;
+                                break;
+                            }
+                            cap_ptr = (cap >> 8) & 0xFC; // Next capability pointer
+                        }
+                    }
+                    
+                    // If using MMCONFIG, we can use the full 4K if the device supports it
+                    if (use_mmcfg && cfg_size == 4096u) {
+                        cfg_size = 4096u;
+                        DBG("  Using 4K config space (MMCFG + PCIe)\n");
+                    } else {
+                        cfg_size = 256u; // Fall back to 256 bytes for non-PCIe devices
+                        DBG("  Using 256B config space (CF8/CFC or non-PCIe)\n");
+                    }
+                    
                     struct gonzo_pci_hdr hdr;
                     hdr.bus = (u8)bus;
                     hdr.dev = (u8)dev;
@@ -193,6 +234,11 @@ int pci_build_blob(void)
             }
         }
     }
+	if (pci_blob_len > 0) {
+		int ret = gonzo_dump_to_file("dekermit.pci", pci_blob, pci_blob_len);
+		if (ret)
+			DBG("failed to dump pci blob: %d\n", ret);
+	}
     return 0;
 }
 

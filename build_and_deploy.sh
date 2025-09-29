@@ -52,6 +52,9 @@ fi
 
 echo "[*] Mounting loopback image: ${BOOT_IMAGE}"
 TMPDIR="$(mktemp -d)"
+echo "====="
+echo $TMPDIR
+echo "====="
 LOOPDEV=""
 
 cleanup() {

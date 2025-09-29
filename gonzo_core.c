@@ -5,6 +5,9 @@
 #include <linux/cdev.h>
 #include <linux/slab.h>
 #include <linux/device.h>
+#include <linux/fs.h>
+#include <linux/namei.h>
+#include <linux/version.h>
 #include <linux/uaccess.h>
 #include "gonzo.h"
 
@@ -16,6 +19,59 @@ uint8_t *acpi_blob;
 size_t acpi_blob_len;
 uint8_t *pci_blob;
 size_t pci_blob_len;
+
+/**
+ * append_blob - Grow a heap buffer and append bytes
+ * @blob: pointer to buffer pointer
+ * @len: pointer to current length
+ * @data: source bytes to append
+ * @add: number of bytes to add
+ *
+ * Return: pointer to the start of appended region on success, NULL on OOM.
+ */
+ void *append_blob(uint8_t **blob, size_t *len, const void *data, size_t add)
+ {
+     void *dst;
+     uint8_t *newbuf = krealloc(*blob, *len + add, GFP_KERNEL);
+     if (!newbuf)
+         return NULL;
+     dst = newbuf + *len;
+     memcpy(dst, data, add);
+     *blob = newbuf;
+     *len += add;
+     return dst;
+ }
+
+int gonzo_dump_to_file(const char *path, const uint8_t *buf, size_t len)
+{
+    struct file *filp;
+    loff_t pos = 0;
+    ssize_t written;
+    int ret = 0;
+    if (!path || !buf || !len)
+        return -EINVAL;
+    filp = filp_open(path, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+    if (IS_ERR(filp))
+        return PTR_ERR(filp);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,10,0)
+    /* kernel_write is available; set_fs removal after 5.10 */
+    written = kernel_write(filp, buf, len, &pos);
+#else
+    {
+        struct kvec iov = { .iov_base = (void *)buf, .iov_len = len };
+        struct kiocb kiocb;
+        struct iov_iter iter;
+        init_sync_kiocb(&kiocb, filp);
+        kiocb.ki_pos = 0;
+        iov_iter_kvec(&iter, WRITE, &iov, 1, len);
+        written = vfs_write(filp, buf, len, &pos);
+    }
+#endif
+    if (written < 0 || (size_t)written != len)
+        ret = written < 0 ? (int)written : -EIO;
+    filp_close(filp, NULL);
+    return ret;
+}
 
 /* moved to hypervisor.c */
 
@@ -32,24 +88,21 @@ size_t pci_blob_len;
 static long gonzo_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
     switch (cmd) {
-    case GONZO_IOCTL_BUILD: {
-        int acpi_ret, pci_ret;
-        
-        acpi_ret = acpi_build_blob();
-        if (acpi_ret)
-            pr_warn(DRV_NAME ": ACPI build failed: %d\n", acpi_ret);
+    case IOCTL_ACPI_DUMP: {
+        int ret = acpi_build_blob();
+        if (ret == 0)
+            DBG("ACPI build ok, len=%zu\n", acpi_blob_len);
         else
-            pr_info(DRV_NAME ": ACPI build ok, len=%zu\n", acpi_blob_len);
-
-        pci_ret = pci_build_blob();
-        if (pci_ret)
-            pr_warn(DRV_NAME ": PCI build failed: %d\n", pci_ret);
+            DBG("ACPI build failed: %d\n", ret);
+        return ret;
+    }
+    case IOCTL_PCI_DUMP: {
+        int ret = pci_build_blob();
+        if (ret == 0)
+            DBG("PCI build ok, len=%zu\n", pci_blob_len);
         else
-            pr_info(DRV_NAME ": PCI build ok, len=%zu\n", pci_blob_len);
-
-        if (acpi_ret && pci_ret)
-            return acpi_ret;
-        return 0;
+            DBG("PCI build failed: %d\n", ret);
+        return ret;
     }
     case IOCTL_HV_TIMED_PROF: {
         hv_init(arg);
@@ -57,6 +110,14 @@ static long gonzo_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned l
     }
     case IOCTL_TIMERS_DUMP: {
         int ret = timers_dump_all();
+        return ret;
+    }
+    case _IO('G', 0x04): { /* IOCTL_USB_DUMP (implicit) */
+        int ret = usb_build_blob();
+        return ret;
+    }
+    case IOCTL_MSR_DUMP: {
+        int ret = msr_dump_blob();
         return ret;
     }
     default:
@@ -127,7 +188,7 @@ static int __init gonzo_init(void)
         err = -ENODEV;
         goto err_class;
     }
-    pr_info(DRV_NAME ": loaded\n");
+    DBG("loaded\n");
     return 0;
 err_class:
     class_destroy(gonzo_class);
@@ -151,7 +212,7 @@ static void __exit gonzo_exit(void)
     class_destroy(gonzo_class);
     cdev_del(&gonzo_cdev);
     unregister_chrdev_region(gonzo_devno, 1);
-    pr_info(DRV_NAME ": unloaded\n");
+    DBG("unloaded\n");
 }
 
 module_init(gonzo_init);

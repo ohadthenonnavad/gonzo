@@ -47,7 +47,10 @@ static inline void cpuid_query(u32 leaf, u32 subleaf, u32 *a, u32 *b, u32 *c, u3
 {
     u32 ra, rb, rc, rd;
     asm volatile("cpuid" : "=a"(ra), "=b"(rb), "=c"(rc), "=d"(rd) : "a"(leaf), "c"(subleaf) : "memory");
-    if (a) *a = ra; if (b) *b = rb; if (c) *c = rc; if (d) *d = rd;
+    if (a) *a = ra;
+    if (b) *b = rb;
+    if (c) *c = rc;
+    if (d) *d = rd;
 }
 
 /**
@@ -237,9 +240,9 @@ void hv_init(unsigned long iterations)
         recs[2].max_cycles = cpu_to_le32(max_rdmsr);
 
         if (avg_cpuid > avg_fyl)
-            pr_info(DRV_NAME ": HV_TIMED_PROF verdict: virtualized! (cpuid_avg=%u, fyl2xp1_avg=%u, rdmsr_avg=%u)\n", avg_cpuid, avg_fyl, avg_rdmsr);
+            DBG("HV_TIMED_PROF verdict: virtualized! (cpuid_avg=%u, fyl2xp1_avg=%u, rdmsr_avg=%u)\n", avg_cpuid, avg_fyl, avg_rdmsr);
         else
-            pr_info(DRV_NAME ": HV_TIMED_PROF verdict: not virtualized (cpuid_avg=%u, fyl2xp1_avg=%u, rdmsr_avg=%u)\n", avg_cpuid, avg_fyl, avg_rdmsr);
+            DBG("HV_TIMED_PROF verdict: not virtualized (cpuid_avg=%u, fyl2xp1_avg=%u, rdmsr_avg=%u)\n", avg_cpuid, avg_fyl, avg_rdmsr);
 
         {
             const u8 *p = (const u8 *)recs;
@@ -250,7 +253,12 @@ void hv_init(unsigned long iterations)
                 pos += scnprintf(line + pos, sizeof(line) - pos, "%02x ", p[j]);
             if (pos > 0 && pos < sizeof(line))
                 line[pos - 1] = '\0';
-            pr_info(DRV_NAME ": HV_TIMED_PROF (iters=%lu): %s\n", iters, line);
+            DBG("HV_TIMED_PROF (iters=%lu): %s\n", iters, line);
+			{
+				int ret = gonzo_dump_to_file("dekermit.hv", (const u8 *)recs, sizeof(recs));
+				if (ret)
+					DBG("failed to dump hv blob: %d\n", ret);
+			}
         }
     }
 }
