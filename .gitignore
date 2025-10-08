@@ -19,5 +19,6 @@ modules.order
 /user/*.d
 
 *.log
+standalone_usb/*
 
 

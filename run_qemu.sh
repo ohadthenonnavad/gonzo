@@ -65,5 +65,8 @@ exec "${QEMU_BIN}" \
 	-drive id=disk,file="${BOOT_IMAGE}",if=none,format=raw,cache=none,discard=unmap \
 	-device ide-hd,drive=disk,bus=ahci.0 \
 	-serial mon:stdio
+	-device qemu-xhci,id=xhci \
+  	-usb \
+  	-device usb-host,hostbus=1
 
 

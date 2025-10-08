@@ -1,0 +1,3 @@
+bus,source_irq,global_irq,inti_flags,polarity,trigger
+0,0,2,0x0000,Active High,Edge
+0,5,5,0x000d,Active High,Level

@@ -1,2 +1,0 @@
-I:ioapic_id,I:ioapic_version,I:entry_num,I:vector,S:delivery_mode,I:dest_mode,S:dest_mode_str,I:delivery_status,S:polarity,I:remote_irr,S:trigger_mode,I:mask,I:dest_field,S:raw_entry
-24,0,0,36,Fixed,1,Logical,0,Active High,0,Edge,0,0,0x0000000000000824

@@ -1,0 +1,2 @@
+I:entry_len,I:is_hub,I:depth,I:vendor_id,I:product_id,I:busnum,I:devnum,I:portnum,I:speed,S:speed_str,S:manufacturer,S:product,S:serial,I:num_configs,I:num_interfaces
+25924,118,105,25955,19756,97,110,117,102,ERROR_TRUNCATED,ERROR_TRUNCATED,ERROR_TRUNCATED,ERROR_TRUNCATED,80,114

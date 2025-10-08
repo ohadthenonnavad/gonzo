@@ -1,0 +1,2 @@
+Device,Manufacturer,Product,Serial,VID,PID,Class,Subclass,Protocol,Speed,MaxPower(mA),NumConfigs,NumInterfaces,NumEndpoints
+1-1.2,SanDisk,SanDisk Cruzer,4C530000110215119257,0x0781,0x5581,Mass Storage,SCSI,Transparent,High,200,1,1,2

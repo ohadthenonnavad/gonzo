@@ -13,6 +13,8 @@
 
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/printk.h>
 #include <linux/types.h>
 #include <linux/string.h>
 #include <linux/slab.h>
@@ -39,8 +41,7 @@ enum timer_type {
 
 /* Common timer header structure */
 struct timer_header {
-    uint8_t timer_enum;    /* timer type (see enum timer_type) */
-    uint8_t reserved[3];   /* padding to 4-byte boundary */
+    __le32 type;           /* timer type (see enum timer_type) */
     __le32 data_size;      /* size of following data in bytes */
 } __packed;
 
@@ -53,15 +54,54 @@ struct timer_header {
 /* ACPI timer data */
 struct acpi_timer_data {
     __le32 counter_value;  /* 32-bit counter value */
-    __le32 reserved;       /* Padding to 8 bytes */
+} __packed;
+
+/* IOAPIC Interrupt Source Override */
+struct ioapic_irq_override {
+    __u8 bus;               /* Bus number */
+    __u8 source_irq;        /* Source IRQ */
+    __u32 global_irq;       /* Global system interrupt */
+    __u16 inti_flags;       /* MPS INTI flags */
+} __packed;
+
+/* IOAPIC NMI Source */
+struct ioapic_nmi_source {
+    __u32 global_irq;       /* Global system interrupt */
+    __u16 inti_flags;       /* MPS INTI flags */
+} __packed;
+
+/* IOAPIC entry type counts */
+struct ioapic_entry_counts {
+    __le32 num_ioapic;      /* Number of IOAPIC entries */
+    __le32 num_irq_override; /* Number of IRQ override entries */
+    __le32 num_nmi_source;   /* Number of NMI source entries */
 } __packed;
 
 /* IOAPIC timer configuration */
 struct ioapic_timer_config {
-    __le32 ioapic_id;      /* IOAPIC ID */
-    __le32 ioapic_version; /* IOAPIC version */
-    __le32 redir_table[64]; /* Redirection table entries */
+    /* Header with entry type counts */
+    __le32 magic;           /* Magic number IOAPIC */
+    __le32 version;         /* Structure version */
+    __le32 header_size;     /* Size of this header */
+    __le32 num_ioapic;      /* Number of IOAPIC entries */
+    __le32 num_irq_override; /* Number of IRQ override entries */
+    __le32 num_nmi_source;   /* Number of NMI source entries */
+    
+    /* IOAPIC-specific data */
+    __le32 ioapic_id;       /* IOAPIC ID */
+    __le32 ioapic_version;  /* IOAPIC version */
+    __le32 gsi_base;        /* Global System Interrupt base */
+    __le32 redir_table[64];  /* Redirection table entries (64 entries * 32 bits each) */
+    
+    /* Followed by:
+     * - Array of ioapic_irq_override (num_irq_override entries)
+     * - Array of ioapic_nmi_source (num_nmi_source entries)
+     */
 } __packed;
+
+/* IOAPIC magic number and version */
+#define IOAPIC_MAGIC 0x4F41504F  /* 'OAPO' in ASCII */
+#define IOAPIC_VERSION 1
 
 /* Global timer buffers */
 static uint8_t *hpet_buffer;
@@ -93,19 +133,29 @@ static int append_timer_data(uint8_t **buffer, size_t *len, enum timer_type time
     struct timer_header hdr;
     uint8_t *newbuf;
     
-    hdr.timer_enum = timer_type;
-    hdr.reserved[0] = hdr.reserved[1] = hdr.reserved[2] = 0;
+    /* Initialize header */
+    hdr.type = cpu_to_le32(timer_type);
     hdr.data_size = cpu_to_le32(data_size);
     
+    /* Allocate or reallocate buffer */
     newbuf = krealloc(*buffer, *len + sizeof(hdr) + data_size, GFP_KERNEL);
-    if (!newbuf)
+    if (!newbuf) {
+        DBG("Failed to reallocate timer data buffer\n");
         return -ENOMEM;
-    
-    memcpy(newbuf + *len, &hdr, sizeof(hdr));
-    memcpy(newbuf + *len + sizeof(hdr), data, data_size);
+    }
     
     *buffer = newbuf;
-    *len += sizeof(hdr) + data_size;
+    
+    /* Copy header */
+    memcpy(*buffer + *len, &hdr, sizeof(hdr));
+    *len += sizeof(hdr);
+    
+    /* Copy data */
+    if (data && data_size > 0) {
+        memcpy(*buffer + *len, data, data_size);
+        *len += data_size;
+    }
+    
     return 0;
 }
 
@@ -380,8 +430,6 @@ static int dump_acpi_timer(void)
     }
     
     timer_data.counter_value = cpu_to_le32(counter_value);
-    timer_data.reserved = 0;
-    
     /* Append to buffer */
     ret = append_timer_data(&acpi_timer_buffer, &acpi_timer_buffer_len, TIMER_ACPI,
                            &timer_data, sizeof(timer_data));
@@ -404,76 +452,206 @@ static int dump_acpi_timer(void)
  */
 static int dump_ioapic_config(void)
 {
-    struct ioapic_timer_config ioapic_data;
-    void __iomem *ioapic_base;
-    u32 ioapic_id, ioapic_version;
-    int i, ret = 0;
-    
-    /* Allocate new buffer */
-    ioapic_buffer = kmalloc(sizeof(struct timer_header) + sizeof(ioapic_data), GFP_KERNEL);
-    if (!ioapic_buffer) {
-        DBG("Failed to allocate IOAPIC buffer\n");
-        return -ENOMEM;
-    }
-    ioapic_buffer_len = 0;
-    
-    /* Check if IOAPIC is supported - use alternative detection for older kernels */
-    /* For now, we'll try to access the default IOAPIC base and see if it works */
-    DBG("Attempting IOAPIC detection\n");
-    
-    /* Check if ACPI MADT is available for IOAPIC discovery */
-    if (acpi_disabled) {
-        DBG("ACPI disabled, cannot discover IOAPIC configuration\n");
-        kfree(ioapic_buffer);
-        ioapic_buffer = NULL;
+    struct acpi_table_header *madt;
+    struct acpi_subtable_header *entry;
+    struct ioapic_timer_config *ioapic_data = NULL;
+    struct ioapic_irq_override *override_ptr = NULL;
+    struct ioapic_nmi_source *nmi_ptr = NULL;
+    void *madt_end;
+    u32 num_ioapic = 0, num_irq_override = 0, num_nmi_source = 0;
+    size_t header_size, buffer_size, data_size;
+    u8 *buffer_ptr = NULL;
+    acpi_status status;
+    int i, num_ioapics = 0;
+
+    /* Get MADT table */
+    status = acpi_get_table(ACPI_SIG_MADT, 0, &madt);
+    if (ACPI_FAILURE(status)) {
+        DBG("Failed to get MADT table\n");
         return -ENODEV;
     }
+
+    DBG("MADT found at %p, length: %u\n", madt, madt->length);
+    /* Print first 256 bytes or full table, whichever is smaller */
+    {
+        size_t dump_len = madt->length > 256 ? 256 : madt->length;
+        print_hex_dump(KERN_DEBUG, "MADT: ", DUMP_PREFIX_OFFSET, 16, 1, madt, dump_len, true);
+    }
+    madt_end = (void *)madt + madt->length;
+
+    /* First pass: count different entry types */
+    entry = (struct acpi_subtable_header *)((char *)madt + 0x2c);
+    while ((void *)entry < madt_end) {
+        if (entry->length == 0) {
+            DBG("Invalid zero-length MADT entry, stopping parse\n");
+            break;
+        }
+
+        switch (entry->type) {
+            case ACPI_MADT_TYPE_IO_APIC:
+                num_ioapic++;
+                DBG("Found IOAPIC entry, count: %u\n", num_ioapic);
+                break;
+                
+            case ACPI_MADT_TYPE_INTERRUPT_OVERRIDE:
+                num_irq_override++;
+                DBG("Found IRQ override entry, count: %u\n", num_irq_override);
+                break;
+                
+            case ACPI_MADT_TYPE_NMI_SOURCE:
+                num_nmi_source++;
+                DBG("Found NMI source entry, count: %u\n", num_nmi_source);
+                break;
+                
+            default:
+                DBG("Skipping MADT entry type: 0x%02x\n", entry->type);
+                break;
+        }
+        
+        entry = (struct acpi_subtable_header *)((char *)entry + entry->length);
+       
+        if (entry->length == 0) {
+            DBG("Invalid zero-length MADT entry, stopping parse\n");
+            break;
+        }
+        
+        entry = (struct acpi_subtable_header *)((char *)entry + entry->length );
+        
+    }
     
-    DBG("Attempting to access IOAPIC configuration\n");
+    DBG("IOAPIC Entry Counts: IOAPIC=%u, IRQ Override=%u, NMI Source=%u\n",
+        num_ioapic, num_irq_override, num_nmi_source);
     
-    /* For now, use the first IOAPIC found in MADT */
-    /* This is a simplified implementation - full implementation would
-     * parse MADT to find all IOAPICs and their base addresses */
+    /* Calculate sizes */
+    header_size = sizeof(struct ioapic_timer_config);
+    data_size = header_size + 
+               (num_irq_override * sizeof(struct ioapic_irq_override)) +
+               (num_nmi_source * sizeof(struct ioapic_nmi_source));
     
-    /* Use default IOAPIC base if available */
-    ioapic_base = ioremap(0xFEC00000, 0x1000); /* Default IOAPIC base */
-    if (!ioapic_base) {
-        DBG("Failed to map IOAPIC base\n");
-        kfree(ioapic_buffer);
-        ioapic_buffer = NULL;
+    /* Allocate buffer for timer header + IOAPIC data */
+    buffer_size = sizeof(struct timer_header) + data_size;
+    ioapic_buffer = kmalloc(buffer_size, GFP_KERNEL);
+    if (!ioapic_buffer) {
+        DBG("Failed to allocate IOAPIC buffer\n");
+        acpi_put_table(madt);
         return -ENOMEM;
     }
     
-    /* Read IOAPIC ID and version */
-    ioapic_id = readl(ioapic_base + 0x00);
-    ioapic_version = readl(ioapic_base + 0x01);
+    /* Initialize buffer */
+    buffer_ptr = ioapic_buffer + sizeof(struct timer_header);
+    memset(buffer_ptr, 0, data_size);
     
-    ioapic_data.ioapic_id = cpu_to_le32(ioapic_id);
-    ioapic_data.ioapic_version = cpu_to_le32(ioapic_version);
+    /* Set up IOAPIC header */
+
+    DBG("Setting up IOAPIC header");
+    ioapic_data = (struct ioapic_timer_config *)buffer_ptr;
+    ioapic_data->magic = cpu_to_le32(IOAPIC_MAGIC);
+    ioapic_data->version = cpu_to_le32(IOAPIC_VERSION);
+    ioapic_data->header_size = cpu_to_le32(header_size);
+    ioapic_data->num_ioapic = cpu_to_le32(num_ioapic);
+    ioapic_data->num_irq_override = cpu_to_le32(num_irq_override);
+    ioapic_data->num_nmi_source = cpu_to_le32(num_nmi_source);
     
-    /* Read redirection table entries (simplified - read first 64 entries) */
-    for (i = 0; i < 64; i++) {
-        u32 reg = 0x10 + (i * 2);
-        u32 low = readl(ioapic_base + reg);
-        u32 high = readl(ioapic_base + reg + 4);
-        /* Store as 64-bit value split into two 32-bit parts */
-        ioapic_data.redir_table[i] = cpu_to_le32(low);
-        if (i < 32) /* Only store high parts for first 32 entries to avoid overflow */
-            ioapic_data.redir_table[i + 32] = cpu_to_le32(high);
+    /* Pointers to variable data sections */
+    override_ptr = (struct ioapic_irq_override *)((u8 *)ioapic_data + header_size);
+    nmi_ptr = (struct ioapic_nmi_source *)((u8 *)override_ptr + 
+                                         (num_irq_override * sizeof(struct ioapic_irq_override)));
+    
+    /* Second pass: process all entries */
+    entry = (struct acpi_subtable_header *)((char *)madt + 0x2c);
+    while ((void *)entry < madt_end) {
+        if (entry->length == 0) {
+            break;
+        }
+            
+        switch (entry->type) {
+            case ACPI_MADT_TYPE_IO_APIC: {
+                struct acpi_madt_io_apic *ioapic = (struct acpi_madt_io_apic *)((char *)entry);
+                void __iomem *ioapic_base;
+                int i;
+                
+                DBG("IOAPIC: ID=%u, Addr=0x%llx, GSI Base=%u\n",
+                    ioapic->id, (unsigned long long)ioapic->address, ioapic->global_irq_base);
+               
+                /* Process all IOAPICs */
+                ioapic_base = ioremap(ioapic->address, 0x1000);
+                if (ioapic_base) {
+                    /* Only process the first IOAPIC for now (simplification) */
+                    if (num_ioapics++ == 0) {
+                        ioapic_data->ioapic_id = cpu_to_le32(ioapic->id);
+                        ioapic_data->gsi_base = cpu_to_le32(ioapic->global_irq_base);
+                        ioapic_data->ioapic_version = cpu_to_le32(readl(ioapic_base + 0x01) & 0xFF);
+
+                        /* Read redirection table */
+                        for (i = 0; i < 64; i++) {
+                            u32 reg_high = 0x10 + 2 * i + 1;
+                            u32 low = readl(ioapic_base + 0x10 + 2 * i);
+                            u32 high = readl(ioapic_base + reg_high);
+                            ioapic_data->redir_table[i] = cpu_to_le32(low | (high << 16));
+                        }
+                    }
+                    iounmap(ioapic_base);
+                }
+                break;
+            }
+            
+            case ACPI_MADT_TYPE_INTERRUPT_OVERRIDE: {
+                struct acpi_madt_interrupt_override *madt_override = 
+                    (struct acpi_madt_interrupt_override *)entry;
+                if (override_ptr < (struct ioapic_irq_override *)nmi_ptr) {
+                    override_ptr->bus = madt_override->bus;
+                    override_ptr->source_irq = madt_override->source_irq;
+                    override_ptr->global_irq = cpu_to_le32(madt_override->global_irq);
+                    override_ptr->inti_flags = cpu_to_le16(madt_override->inti_flags);
+                    DBG("override_ptr fields are %lu %lu %lu %lu", override_ptr->bus, override_ptr->source_irq, override_ptr->global_irq, override_ptr->inti_flags);
+                    override_ptr++;
+                }
+                break;
+            }
+            
+            case ACPI_MADT_TYPE_NMI_SOURCE: {
+                struct acpi_madt_nmi_source *madt_nmi = 
+                    (struct acpi_madt_nmi_source *)entry;
+                if (nmi_ptr < (struct ioapic_nmi_source *)((u8 *)buffer_ptr + buffer_size)) {
+                    nmi_ptr->global_irq = cpu_to_le32(madt_nmi->global_irq);
+                    nmi_ptr->inti_flags = cpu_to_le16(madt_nmi->inti_flags);
+                    nmi_ptr++;
+                }
+                break;
+            }
+        
+            default: {
+                break;
+            }
+
+        }
+
+        entry = (struct acpi_subtable_header *)((char *)entry + entry->length);
+       
+    }
+
+    /* Verify we have enough space for the data we wrote */
+    size_t actual_data_size = (u8 *)nmi_ptr + (num_nmi_source * sizeof(struct ioapic_nmi_source)) - (u8 *)ioapic_data;
+    if (actual_data_size > data_size) {
+        DBG("Warning: Data size mismatch: expected %zu, actual %zu\n", 
+            data_size, actual_data_size);
     }
     
-    /* Append to buffer */
-    ret = append_timer_data(&ioapic_buffer, &ioapic_buffer_len, TIMER_IOAPIC,
-                           &ioapic_data, sizeof(ioapic_data));
-    
-    iounmap(ioapic_base);
-    
-    if (ret) {
-        kfree(ioapic_buffer);
-        ioapic_buffer = NULL;
+    /* Set up the timer header */
+    {
+        struct timer_header *header = (struct timer_header *)ioapic_buffer;
+        header->type = cpu_to_le32(TIMER_IOAPIC);
+        header->data_size = cpu_to_le32(data_size);
+
+        DBG("Setting up timer header for IOAPIC, data size: %zu\n", header->data_size);
+        DBG("Setting up timer header for IOAPIC, header_type: %d\n", header->type);
+
+        ioapic_buffer_len = sizeof(struct timer_header) + data_size;
     }
     
-    return ret;
+    acpi_put_table(madt);
+   
+    return 0;
 }
 
 /**
@@ -483,10 +661,25 @@ static int dump_ioapic_config(void)
  *
  * Return: 0 on success, negative errno if all dumps fail
  */
+/* Header structure for timers dump */
+struct timers_dump_header {
+    __le32 magic;           /* 'TIMR' in ASCII */
+    __le32 version;         /* Format version */
+    __le32 hpet_count;      /* Number of HPET timers */
+    __le32 apic_count;      /* Number of APIC timers */
+    __le32 acpi_count;      /* Number of ACPI timers */
+    __le32 ioapic_count;    /* Number of IOAPIC timers */
+    __le32 reserved[2];     /* For future use */
+} __packed;
+
 int timers_dump_all(void)
 {
-    int hpet_ret, apic_ret, acpi_ret, ioapic_ret;
-    int success_count = 0;
+    int hpet_ret = 0, apic_ret = 0, acpi_ret = 0, ioapic_ret = 0;
+    size_t success_count = 0;
+    struct timers_dump_header header = {
+        .magic = cpu_to_le32(0x524D4954), /* 'TIMR' in little-endian */
+        .version = cpu_to_le32(1),
+    };
     
     DBG("Starting timer configuration dump\n");
     DBG("Entering timers_dump_all function\n");
@@ -539,8 +732,37 @@ int timers_dump_all(void)
     if (ioapic_buffer && ioapic_buffer_len)
         append_blob(&timers_blob, &timers_blob_len, ioapic_buffer, ioapic_buffer_len);
 
-    /* Dump to file in current working dir */
-    gonzo_dump_to_file("dekermit.timers", timers_blob, timers_blob_len);
+    /*Finshed, done*/
+
+    /* Prepend header to the blob */
+    {
+        size_t total_size = sizeof(header) + timers_blob_len;
+        void *final_blob = kmalloc(total_size, GFP_KERNEL);
+        
+        if (!final_blob) {
+            DBG("Failed to allocate memory for final timers blob\n");
+            kfree(timers_blob);
+            return -ENOMEM;
+        }
+        
+        /* Update counts in header */
+        header.hpet_count = cpu_to_le32(hpet_buffer && hpet_buffer_len ? 1 : 0);
+        header.apic_count = cpu_to_le32(apic_buffer && apic_buffer_len ? 1 : 0);
+        header.acpi_count = cpu_to_le32(acpi_timer_buffer && acpi_timer_buffer_len ? 1 : 0);
+        header.ioapic_count = cpu_to_le32(ioapic_buffer && ioapic_buffer_len ? 1 : 0);
+        
+        /* Copy header and data */
+        memcpy(final_blob, &header, sizeof(header));
+        if (timers_blob_len > 0) {
+            memcpy((char *)final_blob + sizeof(header), timers_blob, timers_blob_len);
+        }
+        
+        /* Dump to file in current working dir */
+        gonzo_dump_to_file("dekermit.timers", final_blob, total_size);
+        kfree(final_blob);
+    }
+    
+    kfree(timers_blob);
     return 0;
 }
 

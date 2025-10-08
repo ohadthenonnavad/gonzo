@@ -50,41 +50,132 @@ def parse_ioapic_redir_entry(entry_low, entry_high):
     }
 
 def parse_ioapic_blob(data):
-    """Parse IOAPIC data blob into a list of redirection table entries.
+    """Parse IOAPIC data blob into a list of redirection table entries with NMI and overrides.
     
     Args:
-        data: Binary data containing IOAPIC ID, version, and redirection table
+        data: Binary data containing IOAPIC ID, version, redirection table, overrides and NMI sources
         
     Returns:
-        List of dictionaries, each representing a redirection table entry
+        List of dictionaries, each representing a redirection table entry with NMI/override info
     """
-    if len(data) < 8:
-        print("Error: IOAPIC data too short")
+    if len(data) < 24:  # Minimum size for ioapic_timer_config header
+        print(f"Error: IOAPIC data too short ({len(data)} bytes)")
         return []
-        
-    # Parse IOAPIC header (id and version)
-    ioapic_id, ioapic_version = struct.unpack('<II', data[:8])
-    table_data = data[8:]
     
-    # Each redirection entry is 8 bytes (2x 32-bit registers)
-    num_entries = len(table_data) // 8
-    if num_entries == 0 or len(table_data) % 8 != 0:
-        print(f"Warning: Invalid IOAPIC table size: {len(table_data)} bytes")
+    # Parse IOAPIC header (24 bytes)
+    # struct ioapic_timer_config {
+    #   __le32 ioapic_id;       /* IOAPIC ID */
+    #   __le32 ioapic_version;  /* IOAPIC version */
+    #   __le32 gsi_base;        /* Global System Interrupt base */
+    #   __le32 num_irq_overrides; /* Number of IRQ overrides */
+    #   __le32 num_nmi_sources;   /* Number of NMI sources */
+    #   __le32 redir_table[64];  /* Redirection table entries */
+    #   /* Followed by:
+    #    * - Array of ioapic_irq_override (num_irq_overrides entries)
+    #    * - Array of ioapic_nmi_source (num_nmi_sources entries)
+    #    */
+    # };
+    # 
+    # struct ioapic_irq_override {
+    #     __u8 bus;               /* Bus number */
+    #     __u8 source_irq;        /* Source IRQ */
+    #     __u32 global_irq;       /* Global system interrupt */
+    #     __u16 inti_flags;       /* MPS INTI flags */
+    # };
+    # 
+    # struct ioapic_nmi_source {
+    #     __u32 global_irq;       /* Global system interrupt */
+    #     __u16 inti_flags;       /* MPS INTI flags */
+    # };
     
+    # Parse the fixed header (24 bytes)
+    ioapic_id, ioapic_version, gsi_base, num_overrides, num_nmi_sources = \
+        struct.unpack('<IIIII', data[:20])
+    
+    # The redirection table is 64 entries of 4 bytes each (256 bytes)
+    redir_table = list(struct.unpack('<64I', data[20:276]))
+    
+    # Calculate offsets for overrides and NMI sources
+    offset = 276  # 20 (header) + 256 (redir_table)
+    
+    # Read interrupt overrides (8 bytes each)
+    overrides = []
+    override_size = 8  # 1 + 1 + 4 + 2 = 8 bytes
+    for _ in range(num_overrides):
+        if offset + override_size > len(data):
+            print(f"Warning: Not enough data for all overrides at offset {offset}")
+            break
+        bus, source_irq, global_irq, inti_flags = \
+            struct.unpack('<BBHI', data[offset:offset + override_size])
+        overrides.append({
+            'bus': bus,
+            'source_irq': source_irq,
+            'global_irq': global_irq,
+            'inti_flags': inti_flags
+        })
+        offset += override_size
+    
+    # Read NMI sources (6 bytes each)
+    nmi_sources = []
+    nmi_size = 6  # 4 + 2 = 6 bytes
+    for _ in range(num_nmi_sources):
+        if offset + nmi_size > len(data):
+            break
+        global_irq, inti_flags = \
+            struct.unpack('<IH', data[offset:offset + nmi_size])
+        nmi_sources.append({
+            'global_irq': global_irq,
+            'inti_flags': inti_flags,
+            'polarity': 'Active Low' if inti_flags & 0x2 else 'Active High',
+            'trigger': 'Level' if inti_flags & 0x8 else 'Edge'
+        })
+        offset += nmi_size
+    
+    # Generate entries for redirection table with override and NMI info
     entries = []
-    for i in range(min(num_entries, 24)):  # IOAPIC typically has 24 entries
-        offset = i * 8
-        entry_low, entry_high = struct.unpack('<II', table_data[offset:offset+8])
+    for i in range(64):  # Always generate all 64 entries for the redirection table
+        if i < len(redir_table):
+            entry = redir_table[i]
+            entry_low = entry & 0xFFFFFFFF
+            entry_high = (entry >> 32) & 0xFFFFFFFF if i * 8 + 4 < len(data) else 0
+        else:
+            # If we don't have data for this entry, use zeros
+            entry = 0
+            entry_low = 0
+            entry_high = 0
         
-        # Only process valid entries (non-zero)
-        if entry_low != 0 or entry_high != 0:
-            entry = {
-                'I:ioapic_id': ioapic_id,
-                'I:ioapic_version': ioapic_version,
-                'I:entry_num': i,
-                **parse_ioapic_redir_entry(entry_low, entry_high)
-            }
-            entries.append(entry)
+        # Find matching overrides for this entry
+        entry_overrides = [o for o in overrides if o['global_irq'] == gsi_base + i]
+        
+        # Create base entry with all fields
+        entry_data = {
+            'I:ioapic_id': ioapic_id,
+            'I:ioapic_version': ioapic_version & 0xFF,  # Lower byte is version
+            'I:gsi_base': gsi_base,
+            'I:entry_num': i,
+            'I:gsi': gsi_base + i,
+            'I:num_overrides': len(entry_overrides),
+            **parse_ioapic_redir_entry(entry_low, entry_high)
+        }
+        
+        # Add override information
+        if entry_overrides:
+            entry_data['S:overrides'] = ';'.join([
+                f"{o['bus']}:{o['source_irq']}->{o['global_irq']}" 
+                for o in entry_overrides
+            ])
+        
+        # Add NMI information if this entry has an NMI source
+        for nmi in nmi_sources:
+            if nmi['global_irq'] == gsi_base + i:
+                entry_data.update({
+                    'S:nmi_flags': f"0x{nmi['inti_flags']:04x}",
+                    'S:nmi_polarity': nmi['polarity'],
+                    'S:nmi_trigger': nmi['trigger']
+                })
+                break
+                
+        entries.append(entry_data)
     
     return entries
 
@@ -97,22 +188,27 @@ def parse(input_file, output_file):
     """
     try:
         with open(input_file, 'rb') as f:
-            blob_data = f.read()
+            data = f.read()
     except FileNotFoundError:
         print(f"Error: Input file '{input_file}' not found.")
         sys.exit(1)
+    except Exception as e:
+        print(f"Error reading '{input_file}': {e}")
+        sys.exit(1)
     
-    ioapic_entries = parse_ioapic_blob(blob_data)
+    ioapic_entries = parse_ioapic_blob(data)
     
     if not ioapic_entries:
-        print("No valid IOAPIC entries found.")
+        print("No IOAPIC entries found.")
         return
     
-    # Define fieldnames in a logical order
+    # Get all possible field names from the first entry
     fieldnames = [
         'I:ioapic_id',
         'I:ioapic_version',
+        'I:gsi_base',
         'I:entry_num',
+        'I:gsi',
         'I:vector',
         'S:delivery_mode',
         'I:dest_mode',
@@ -123,6 +219,11 @@ def parse(input_file, output_file):
         'S:trigger_mode',
         'I:mask',
         'I:dest_field',
+        'I:num_overrides',
+        'S:overrides',
+        'S:nmi_flags',
+        'S:nmi_polarity',
+        'S:nmi_trigger',
         'S:raw_entry'
     ]
     

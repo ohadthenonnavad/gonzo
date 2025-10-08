@@ -1,4 +1,4 @@
 I:instr_enum,S:instr_name,I:alignment,I:run_count,I:avg_cycles,I:max_cycles
-1,CPUID,0,200,3090,5292
-2,FYL2XP1,0,200,97,332
-3,RDMSR_TSC,0,200,154,634
+1,CPUID,0,200,3622,93768
+2,FYL2XP1,0,200,95,394
+3,RDMSR_TSC,0,200,145,344

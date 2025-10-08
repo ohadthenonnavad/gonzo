@@ -1,0 +1,5 @@
+entry,vector,delivery_mode,dest_mode,polarity,trigger,mask,dest,gsi,raw_value
+0,0,0,0,0,0,0,0,0,0x00020000
+1,0,0,0,0,0,0,0,1,0x00000000
+2,0,5,0,0,0,1,0,2,0x00050500
+3,0,0,0,0,0,1,0,3,0x000d0000
