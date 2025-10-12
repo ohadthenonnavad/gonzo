@@ -8,6 +8,25 @@
 #include <linux/string.h>
 #include "gonzo.h"
 
+/* Kernel version compatibility layer */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 0, 0)
+    #define ACPI_MAP_MEM(pa, len) acpi_os_map_iomem(pa, len)
+    #define ACPI_UNMAP_MEM(ptr, len) acpi_os_unmap_iomem(ptr, len)
+    #define ACPI_MEM_PTR void __iomem *
+    #define ACPI_MEM_CAST(ptr) ((const void __force *)(ptr))
+    #define ACPI_HDR_CAST(ptr) ((struct acpi_table_header __force *)(ptr))
+    #define ACPI_MEMCPY_FROM(dst, src, len) memcpy_fromio(dst, src, len)
+    #define ACPI_HAS_PUT_TABLE 1
+#else
+    #define ACPI_MAP_MEM(pa, len) acpi_os_map_memory(pa, len)
+    #define ACPI_UNMAP_MEM(ptr, len) acpi_os_unmap_memory(ptr, len)
+    #define ACPI_MEM_PTR void *
+    #define ACPI_MEM_CAST(ptr) ((const void *)(ptr))
+    #define ACPI_HDR_CAST(ptr) ((struct acpi_table_header *)(ptr))
+    #define ACPI_MEMCPY_FROM(dst, src, len) memcpy(dst, src, len)
+    #define ACPI_HAS_PUT_TABLE 0
+#endif
+
 
 
 /**
@@ -31,22 +50,22 @@ static bool rsdp_checksum_ok(const u8 *p, size_t len)
  */
 static int append_table_phys(phys_addr_t pa, const char *why)
 {
-    void *hdr_io;
+    ACPI_MEM_PTR hdr_io;
     u32 len;
-    void *tbl_io;
+    ACPI_MEM_PTR tbl_io;
     if (!pa)
         return -EINVAL;
-    hdr_io = acpi_os_map_memory(pa, sizeof(struct acpi_table_header));
+    hdr_io = ACPI_MAP_MEM(pa, sizeof(struct acpi_table_header));
     if (!hdr_io)
         return -ENODEV;
-    len = le32_to_cpu(((struct acpi_table_header *)hdr_io)->length);
-    acpi_os_unmap_memory(hdr_io, sizeof(struct acpi_table_header));
-    tbl_io = acpi_os_map_memory(pa, len);
+    len = le32_to_cpu(ACPI_HDR_CAST(hdr_io)->length);
+    ACPI_UNMAP_MEM(hdr_io, sizeof(struct acpi_table_header));
+    tbl_io = ACPI_MAP_MEM(pa, len);
     if (!tbl_io)
         return -ENODEV;
-    append_blob(&acpi_blob, &acpi_blob_len, (const void *)tbl_io, len);
+    append_blob(&acpi_blob, &acpi_blob_len, ACPI_MEM_CAST(tbl_io), len);
     DBG("ACPI: appended table via %s pa=%pa len=%u\n", why, &pa, len);
-    acpi_os_unmap_memory(tbl_io, len);
+    ACPI_UNMAP_MEM(tbl_io, len);
     return 0;
 }
 
@@ -55,9 +74,9 @@ static int append_table_phys(phys_addr_t pa, const char *why)
  * @base: mapped XSDT or RSDT base
  * @is_xsdt: true for XSDT (64-bit entries) false for RSDT (32-bit)
  */
-static void collect_from_sdt(void *base, bool is_xsdt)
+static void collect_from_sdt(ACPI_MEM_PTR base, bool is_xsdt)
 {
-    struct acpi_table_header *hdr = base;
+    struct acpi_table_header *hdr = ACPI_HDR_CAST(base);
     u32 total_len = le32_to_cpu(hdr->length);
     int entry_size = is_xsdt ? sizeof(u64) : sizeof(u32);
     int cnt = (total_len - sizeof(struct acpi_table_header)) / entry_size;
@@ -67,39 +86,39 @@ static void collect_from_sdt(void *base, bool is_xsdt)
         phys_addr_t tpa;
         if (is_xsdt) {
             u64 tpa64;
-            memcpy(&tpa64, (u8 *)base + sizeof(struct acpi_table_header) + i * sizeof(u64), sizeof(u64));
+            ACPI_MEMCPY_FROM(&tpa64, (u8 __iomem *)base + sizeof(struct acpi_table_header) + i * sizeof(u64), sizeof(u64));
             tpa = (phys_addr_t)tpa64;
         } else {
             u32 tpa32;
-            memcpy(&tpa32, (u8 *)base + sizeof(struct acpi_table_header) + i * sizeof(u32), sizeof(u32));
+            ACPI_MEMCPY_FROM(&tpa32, (u8 __iomem *)base + sizeof(struct acpi_table_header) + i * sizeof(u32), sizeof(u32));
             tpa = (phys_addr_t)tpa32;
         }
         {
-            void *th = acpi_os_map_memory(tpa, sizeof(struct acpi_table_header));
+            ACPI_MEM_PTR th = ACPI_MAP_MEM(tpa, sizeof(struct acpi_table_header));
             u32 tlen;
             char sig4[5];
             if (!th)
                 continue;
-            memcpy(sig4, th, 4);
+            ACPI_MEMCPY_FROM(sig4, th, 4);
             sig4[4] = '\0';
-            tlen = le32_to_cpu(((struct acpi_table_header *)th)->length);
-            acpi_os_unmap_memory(th, sizeof(struct acpi_table_header));
-            th = acpi_os_map_memory(tpa, tlen);
+            tlen = le32_to_cpu(ACPI_HDR_CAST(th)->length);
+            ACPI_UNMAP_MEM(th, sizeof(struct acpi_table_header));
+            th = ACPI_MAP_MEM(tpa, tlen);
             if (!th)
                 continue;
             DBG("ACPI: (manual) %s entry %d pa=%pa sig=%s len=%u\n",
                     is_xsdt ? "XSDT" : "RSDT", i, &tpa, sig4, tlen);
-            append_blob(&acpi_blob, &acpi_blob_len, (const void *)th, tlen);
+            append_blob(&acpi_blob, &acpi_blob_len, ACPI_MEM_CAST(th), tlen);
             if (sig4[0] == 'F' && sig4[1] == 'A' && sig4[2] == 'C' && sig4[3] == 'P') {
                 u32 fwctrl = 0, dsdt = 0;
-                memcpy(&fwctrl, (u8 *)th + sizeof(struct acpi_table_header) + 0x00, sizeof(u32));
-                memcpy(&dsdt, (u8 *)th + sizeof(struct acpi_table_header) + 0x04, sizeof(u32));
+                ACPI_MEMCPY_FROM(&fwctrl, (u8 __iomem *)th + sizeof(struct acpi_table_header) + 0x00, sizeof(u32));
+                ACPI_MEMCPY_FROM(&dsdt, (u8 __iomem *)th + sizeof(struct acpi_table_header) + 0x04, sizeof(u32));
                 if (fwctrl)
                     append_table_phys((phys_addr_t)fwctrl, "FADT.FirmwareCtrl");
                 if (dsdt)
                     append_table_phys((phys_addr_t)dsdt, "FADT.Dsdt");
             }
-            acpi_os_unmap_memory(th, tlen);
+            ACPI_UNMAP_MEM(th, tlen);
         }
     }
 }
@@ -202,18 +221,18 @@ static int acpi_build_manual(void)
         phys_addr_t pa = (phys_addr_t)rsdp.xsdt_physical_address;
         struct acpi_table_header *xh;
         u32 len;
-        void *base = acpi_os_map_memory(pa, sizeof(struct acpi_table_header));
+        ACPI_MEM_PTR base = ACPI_MAP_MEM(pa, sizeof(struct acpi_table_header));
         if (!base)
             return -ENODEV;
-        xh = base;
+        xh = ACPI_HDR_CAST(base);
         len = le32_to_cpu(xh->length);
-        acpi_os_unmap_memory(base, sizeof(struct acpi_table_header));
-        base = acpi_os_map_memory(pa, len);
+        ACPI_UNMAP_MEM(base, sizeof(struct acpi_table_header));
+        base = ACPI_MAP_MEM(pa, len);
         if (!base)
             return -ENODEV;
-        append_blob(&acpi_blob, &acpi_blob_len, (const void *)base, len);
+        append_blob(&acpi_blob, &acpi_blob_len, ACPI_MEM_CAST(base), len);
         collect_from_sdt(base, true);
-        acpi_os_unmap_memory(base, len);
+        ACPI_UNMAP_MEM(base, len);
         DBG("ACPI: (manual) total blob len after XSDT=%zu\n", acpi_blob_len);
         return 0;
     }
@@ -222,18 +241,18 @@ static int acpi_build_manual(void)
         phys_addr_t pa = (phys_addr_t)rsdp.v1.rsdt_physical_address;
         struct acpi_table_header *rh;
         u32 len;
-        void *base = acpi_os_map_memory(pa, sizeof(struct acpi_table_header));
+        ACPI_MEM_PTR base = ACPI_MAP_MEM(pa, sizeof(struct acpi_table_header));
         if (!base)
             return -ENODEV;
-        rh = base;
+        rh = ACPI_HDR_CAST(base);
         len = le32_to_cpu(rh->length);
-        acpi_os_unmap_memory(base, sizeof(struct acpi_table_header));
-        base = acpi_os_map_memory(pa, len);
+        ACPI_UNMAP_MEM(base, sizeof(struct acpi_table_header));
+        base = ACPI_MAP_MEM(pa, len);
         if (!base)
             return -ENODEV;
-        append_blob(&acpi_blob, &acpi_blob_len, (const void *)base, len);
+        append_blob(&acpi_blob, &acpi_blob_len, ACPI_MEM_CAST(base), len);
         collect_from_sdt(base, false);
-        acpi_os_unmap_memory(base, len);
+        ACPI_UNMAP_MEM(base, len);
         DBG("ACPI: (manual) total blob len after RSDT=%zu\n", acpi_blob_len);
         return 0;
     }
@@ -273,10 +292,10 @@ static int acpi_build_acpica(void)
             phys_addr_t pa = ((u32 *)((u8 *)rsdt + sizeof(*rsdt)))[i];
             struct acpi_table_header *hdr;
             u32 len;
-            void *base = acpi_os_map_memory(pa, sizeof(struct acpi_table_header));
+            ACPI_MEM_PTR base = ACPI_MAP_MEM(pa, sizeof(struct acpi_table_header));
             if (!base)
                 continue;
-            hdr = base;
+            hdr = ACPI_HDR_CAST(base);
             len = le32_to_cpu(hdr->length);
             {
                 char sig[5];
@@ -284,15 +303,15 @@ static int acpi_build_acpica(void)
                 sig[4] = '\0';
                 DBG("ACPI: RSDT entry %d pa=%pa sig=%s len=%u\n", i, &pa, sig, len);
             }
-            acpi_os_unmap_memory(base, sizeof(struct acpi_table_header));
-            base = acpi_os_map_memory(pa, len);
+            ACPI_UNMAP_MEM(base, sizeof(struct acpi_table_header));
+            base = ACPI_MAP_MEM(pa, len);
             if (!base)
                 continue;
-            append_blob(&acpi_blob, &acpi_blob_len, (const void *)base, len);
-            acpi_os_unmap_memory(base, len);
+            append_blob(&acpi_blob, &acpi_blob_len, ACPI_MEM_CAST(base), len);
+            ACPI_UNMAP_MEM(base, len);
         }
         DBG("ACPI: total blob len after RSDT=%zu\n", acpi_blob_len);
-        /* No acpi_put_table() in kernel 3.10 */
+        /* acpi_put_table() only in kernel 4.13+ */
         return 0;
     }
 
@@ -304,10 +323,10 @@ static int acpi_build_acpica(void)
         phys_addr_t pa = (phys_addr_t)le64_to_cpu(entries[i]);
         struct acpi_table_header *hdr;
         u32 len;
-        void *base = acpi_os_map_memory(pa, sizeof(struct acpi_table_header));
+        ACPI_MEM_PTR base = ACPI_MAP_MEM(pa, sizeof(struct acpi_table_header));
         if (!base)
             continue;
-        hdr = base;
+        hdr = ACPI_HDR_CAST(base);
         len = le32_to_cpu(hdr->length);
         {
             char sig[5];
@@ -315,15 +334,17 @@ static int acpi_build_acpica(void)
             sig[4] = '\0';
             DBG("ACPI: XSDT entry %d pa=%pa sig=%s len=%u\n", i, &pa, sig, len);
         }
-        acpi_os_unmap_memory(base, sizeof(struct acpi_table_header));
-        base = acpi_os_map_memory(pa, len);
+        ACPI_UNMAP_MEM(base, sizeof(struct acpi_table_header));
+        base = ACPI_MAP_MEM(pa, len);
         if (!base)
             continue;
-        append_blob(&acpi_blob, &acpi_blob_len, (const void *)base, len);
-        acpi_os_unmap_memory(base, len);
+        append_blob(&acpi_blob, &acpi_blob_len, ACPI_MEM_CAST(base), len);
+        ACPI_UNMAP_MEM(base, len);
     }
     DBG("ACPI: total blob len after XSDT=%zu\n", acpi_blob_len);
-    /* No acpi_put_table() in kernel 3.10 */
+#if ACPI_HAS_PUT_TABLE
+    acpi_put_table(xsdt);
+#endif
     return 0;
 }
 
@@ -341,4 +362,5 @@ int acpi_build_blob(void)
     return ret;
 }
 
+MODULE_DESCRIPTION("Gonzo ACPI builder");
 MODULE_LICENSE("GPL");
