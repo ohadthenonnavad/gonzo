@@ -1,7 +1,8 @@
 obj-m += gonzo.o
-gonzo-objs := gonzo_core.o acpi_dump.o pci_dump.o hypervisor.o timers.o usb.o msr.o
+gonzo-objs := gonzo_core.o acpi_dump.o hypervisor.o usb.o msr.o net_logger.o
 
-KDIR ?= /lib/modules/$(shell uname -r)/build
+#KDIR ?= /lib/modules/$(shell uname -r)/build
+KDIR ?= /kernel/linux-3.10
 PWD  := $(shell pwd)
 
 EXTRA_CFLAGS += -O2 -g -DDEBUG

@@ -6,8 +6,19 @@
 #define DRV_NAME "gonzo"
 
 /* Debug macro */
+/* Network logger functions */
+int netlog_init(void);
+void netlog_exit(void);
+void netlog_printk(const char *fmt, ...);
+int netlog_wait_for_client(unsigned int timeout_sec);
+int netlog_init_and_wait(unsigned int timeout_sec);
+
+/* Debug macro that prints to both kernel log and network */
 #ifndef DBG
-#define DBG(fmt, ...) printk(KERN_DEBUG fmt, ##__VA_ARGS__)
+#define DBG(fmt, ...) do { \
+    printk(KERN_DEBUG fmt, ##__VA_ARGS__); \
+    netlog_printk(fmt, ##__VA_ARGS__); \
+} while (0)
 #endif
 
 /* IOCTLs */

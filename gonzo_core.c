@@ -3,6 +3,7 @@
 #include <linux/init.h>
 #include <linux/fs.h>
 #include <linux/cdev.h>
+#include <linux/usb.h>
 #include <linux/slab.h>
 #include <linux/device.h>
 #include <linux/fs.h>
@@ -53,19 +54,12 @@ int gonzo_dump_to_file(const char *path, const uint8_t *buf, size_t len)
     filp = filp_open(path, O_WRONLY|O_CREAT|O_TRUNC, 0644);
     if (IS_ERR(filp))
         return PTR_ERR(filp);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5,10,0)
-    /* kernel_write is available; set_fs removal after 5.10 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,14,0)
+    /* kernel_write signature changed in 4.14 to take loff_t pointer */
     written = kernel_write(filp, buf, len, &pos);
 #else
-    {
-        struct kvec iov = { .iov_base = (void *)buf, .iov_len = len };
-        struct kiocb kiocb;
-        struct iov_iter iter;
-        init_sync_kiocb(&kiocb, filp);
-        kiocb.ki_pos = 0;
-        iov_iter_kvec(&iter, WRITE, &iov, 1, len);
-        written = vfs_write(filp, buf, len, &pos);
-    }
+    /* Old kernels (3.10, etc) take loff_t by value */
+    written = kernel_write(filp, buf, len, pos);
 #endif
     if (written < 0 || (size_t)written != len)
         ret = written < 0 ? (int)written : -EIO;
@@ -96,6 +90,7 @@ static long gonzo_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned l
             DBG("ACPI build failed: %d\n", ret);
         return ret;
     }
+    /*
     case IOCTL_PCI_DUMP: {
         int ret = pci_build_blob();
         if (ret == 0)
@@ -112,8 +107,13 @@ static long gonzo_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned l
         int ret = timers_dump_all();
         return ret;
     }
-    case _IO('G', 0x04): { /* IOCTL_USB_DUMP (implicit) */
+    */
+    case IOCTL_USB_DUMP: {
         int ret = usb_build_blob();
+        if (ret == 0)
+            DBG("USB build ok, len=%zu\n", usb_blob_len);
+        else
+            DBG("USB build failed: %d\n", ret);
         return ret;
     }
     case IOCTL_MSR_DUMP: {
@@ -171,25 +171,58 @@ static const struct file_operations gonzo_fops = {
 static int __init gonzo_init(void)
 {
     int err;
+    
+    /* Initialize network logger and wait for client */
+    err = netlog_init_and_wait(10);
+    if (err) {
+        printk(KERN_ERR "Failed to initialize network logger. Continue without logging: %d\n", err);
+        return err;
+    }
+    
     err = alloc_chrdev_region(&gonzo_devno, 0, 1, DRV_NAME);
     if (err)
-        return err;
+        goto err_netlog;
+        
     cdev_init(&gonzo_cdev, &gonzo_fops);
     gonzo_cdev.owner = THIS_MODULE;
     err = cdev_add(&gonzo_cdev, gonzo_devno, 1);
     if (err)
         goto err_unregister;
+        
     gonzo_class = class_create(THIS_MODULE, DRV_NAME);
     if (IS_ERR(gonzo_class)) {
         err = PTR_ERR(gonzo_class);
         goto err_cdev;
     }
+    
     if (!device_create(gonzo_class, NULL, gonzo_devno, NULL, DRV_NAME)) {
         err = -ENODEV;
         goto err_class;
     }
-    DBG("loaded\n");
+    
+    DBG("Gonzo module loaded\n");
+    
+    /* Initialize and build USB blob */
+    err = usb_build_blob();
+    if (err) {
+        DBG("Failed to build USB blob: %d\n", err);
+        goto err_device;
+    }
+
+    /* Initialize and build ACPI blob */
+    err = acpi_build_blob();
+    if (err) {
+        DBG("Failed to build ACPI tables blob: %d\n", err);
+        goto err_device;
+    }
+   
+    netlog_exit();
     return 0;
+    
+err_device:
+err_netlog:
+    netlog_exit();
+    return err;
 err_class:
     class_destroy(gonzo_class);
 err_cdev:
@@ -208,18 +241,23 @@ static void __exit gonzo_exit(void)
 {
     kfree(acpi_blob);
     kfree(pci_blob);
-    device_destroy(gonzo_class, gonzo_devno);
-    class_destroy(gonzo_class);
+    
+    if (gonzo_class) {
+        device_destroy(gonzo_class, gonzo_devno);
+        class_destroy(gonzo_class);
+    }
+    
     cdev_del(&gonzo_cdev);
     unregister_chrdev_region(gonzo_devno, 1);
-    DBG("unloaded\n");
+    
+    /* Clean up network logger */
+    netlog_exit();
+    
+    DBG("Gonzo module unloaded\n");
 }
 
 module_init(gonzo_init);
 module_exit(gonzo_exit);
 
-MODULE_AUTHOR("gonzo");
 MODULE_DESCRIPTION("Gonzo ACPI/PCI snapshot builder (core)");
 MODULE_LICENSE("GPL");
-
-

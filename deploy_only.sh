@@ -1,35 +1,22 @@
 #!/bin/bash
 set -euo pipefail
-# Usage: ./build_and_deploy.sh /path/to/kernel/build /path/to/boot.img
-# Example: ./build_and_deploy.sh /lib/modules/$(uname -r)/build /path/to/image.img
 
-if [[ ${#} -ne 2 ]]; then
-	echo "Usage: $0 <KDIR> <BOOT_IMAGE.img>" >&2
+# Usage: ./build_and_deploy.sh  /path/to/boot.img
+# Example: ./build_and_deploy.sh  /path/to/image.img
+
+if [[ ${#} -ne 1 ]]; then
+	echo "Usage: $0 <BOOT_IMAGE.img>" >&2
 	exit 1
 fi
 
-KDIR="${1}"
-BOOT_IMAGE="${2}"
+BOOT_IMAGE="${1}"
 
-if [[ ! -d "${KDIR}" ]]; then
-	echo "KDIR not found: ${KDIR}" >&2
-	exit 1
-fi
 
 if [[ ! -f "${BOOT_IMAGE}" ]]; then
 	echo "BOOT_IMAGE not found: ${BOOT_IMAGE}" >&2
 	exit 1
 fi
 
-echo "[*] Building kernel module with KDIR=${KDIR} (debug info enabled)"
-make clean >/dev/null
-make KDIR="${KDIR}"
-
-echo "[*] Building userspace control tool"
-pushd user >/dev/null
-make clean >/dev/null || true
-make
-popd >/dev/null
 
 KO="gonzo.ko"
 CTL="user/gonzo_ctl"
@@ -46,7 +33,7 @@ fi
 
 echo "[*] Ensuring script is running as root for mount/losetup"
 if [[ "${EUID}" -ne 0 ]]; then
-	exec sudo --preserve-env=KDIR,BOOT_IMAGE "$0" "$KDIR" "$BOOT_IMAGE"
+	exec sudo --preserve-env=BOOT_IMAGE "$0" "$BOOT_IMAGE"
 fi
 
 echo "[*] Mounting loopback image: ${BOOT_IMAGE}"
@@ -96,7 +83,10 @@ fi
 echo "[*] Copying artifacts to image rootfs (/ )"
 install -D -m 0644 "${KO}" "${TMPDIR}/gonzo.ko"
 install -D -m 0755 "${CTL}" "${TMPDIR}/gonzo_ctl"
-echo '/bin/sh' > "${TMPDIR}/etc/init.d/rcS"
+echo 'mount -t proc none /proc' > "${TMPDIR}/etc/init.d/rcS"
+echo 'mount -t sysfs none /sys' >> "${TMPDIR}/etc/init.d/rcS"
+echo 'mount -t devtmpfs none /dev' >> "${TMPDIR}/etc/init.d/rcS"
+echo 'exec /bin/sh' >> "${TMPDIR}/etc/init.d/rcS"
 
 echo ${TMPDIR}
 

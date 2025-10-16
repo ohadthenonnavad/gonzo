@@ -43,17 +43,24 @@ fi
 QEMU_BIN=${QEMU_BIN:-qemu-system-x86_64}
 
 # Prefer KVM if available
+# Port forwarding for debug (host:7777 -> guest:7777)
+NET_FLAGS=(
+    -netdev user,id=net0,hostfwd=tcp::7777-:7777
+    -device e1000,netdev=net0
+)
+
 KVM_FLAGS=()
 if [[ -w /dev/kvm ]]; then
-	KVM_FLAGS=( -enable-kvm -cpu host )
+    KVM_FLAGS=( -enable-kvm -cpu host )
 else
-	KVM_FLAGS=( -cpu qemu64 )
+    KVM_FLAGS=( -cpu qemu64 )
 fi
 
 APPEND="console=ttyS0 root=/dev/sda1 init=/sbin/init rw acpi=on"
 
 exec "${QEMU_BIN}" \
-	${KVM_FLAGS[@]} \
+	"${KVM_FLAGS[@]}" \
+	"${NET_FLAGS[@]}" \
 	-m 2048 \
 	-smp 2 \
 	-nographic \
@@ -65,8 +72,8 @@ exec "${QEMU_BIN}" \
 	-drive id=disk,file="${BOOT_IMAGE}",if=none,format=raw,cache=none,discard=unmap \
 	-device ide-hd,drive=disk,bus=ahci.0 \
 	-serial mon:stdio
-	-device qemu-xhci,id=xhci \
-  	-usb \
-  	-device usb-host,hostbus=1
+  	-device usb-ehci,id=ehci \
+	-device usb-storage,bus=ehci.0,drive=usbstick \
+  	-drive id=usbstick,file=usb_drive.img,format=raw,if=none
 
 
